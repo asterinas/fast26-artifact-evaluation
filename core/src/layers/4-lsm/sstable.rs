@@ -114,6 +114,39 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const CACHE_CAP: usize = 1024;
 
+    /// Calculate cache capacity per SSTable based on global configuration.
+    ///
+    /// Distributes the global cache_size (in bytes) evenly across all SSTables.
+    /// Converts bytes to number of RecordBlocks for LRU cache.
+    /// For a 100GB disk with 8GB per SSTable, we have ~13 SSTables max.
+    fn cache_capacity() -> usize {
+        use crate::layers::disk::CONFIG;
+
+        // Maximum number of SSTables: 100GB disk / 8GB per SSTable
+        const MAX_SST_COUNT: usize = 13;
+        const MIN_CACHE_CAP: usize = 64;  // Minimum cache blocks per SSTable
+
+        let total_cache_bytes = CONFIG.get().cache_size;
+
+        // If cache_size is default (usize::MAX), use the original hardcoded value
+        if total_cache_bytes == usize::MAX {
+            return Self::CACHE_CAP;
+        }
+
+        // Convert bytes to number of RecordBlocks
+        // Each RecordBlock is RECORD_BLOCK_SIZE bytes
+        let total_cache_blocks = total_cache_bytes / RECORD_BLOCK_SIZE;
+
+        // Evenly distribute cache blocks across all SSTables, with a minimum threshold
+        let cache_per_sst = (total_cache_blocks / MAX_SST_COUNT).max(MIN_CACHE_CAP);
+
+        println!("total_cache_bytes: {}", total_cache_bytes);
+        println!("total_cache_blocks: {}", total_cache_blocks);
+        println!("cache_blocks_per_sst: {}", cache_per_sst);
+
+        cache_per_sst
+    }
+
     /// Return the ID of this `SSTable`, which is the same ID
     /// to the underlying `TxLog`.
     pub fn id(&self) -> TxLogId {
@@ -328,7 +361,9 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         KVex: AsKVex<K, V>,
         Self: 'a,
     {
-        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
+        let cache_cap = Self::cache_capacity();
+        println!("cache_cap: {}", cache_cap);
+        let mut cache = LruCache::new(NonZeroUsize::new(cache_cap).unwrap());
         let (total_records, index_vec) =
             Self::build_record_blocks(records_iter, tx_log, &mut cache, event_listener)?;
         let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
@@ -506,7 +541,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         let mut rbuf = Buf::alloc(meta.index_nblocks as _)?;
         tx_log.read(nblocks - meta.index_nblocks as usize, rbuf.as_mut())?;
         let mut index = Vec::with_capacity(meta.num_index as _);
-        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
+        let cache_cap = Self::cache_capacity();
+        let mut cache = LruCache::new(NonZeroUsize::new(cache_cap).unwrap());
         let mut record_block = vec![0; RECORD_BLOCK_SIZE];
         for i in 0..meta.num_index as _ {
             let buf =

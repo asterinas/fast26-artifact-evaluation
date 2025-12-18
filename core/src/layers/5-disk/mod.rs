@@ -35,5 +35,7 @@ mod bio;
 mod block_alloc;
 mod data_buf;
 mod sworndisk;
+mod config;
 
-pub use self::sworndisk::SwornDisk;
+pub use self::sworndisk::{SwornDisk, CONFIG};
+pub use self::config::Config;

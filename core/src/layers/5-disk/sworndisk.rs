@@ -11,6 +11,7 @@ use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
+use crate::layers::disk::config::Config;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
@@ -20,15 +21,56 @@ use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
+use lazy_static::lazy_static;
 use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
 use pod::Pod;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
 /// Host Block Address.
 pub type Hba = BlockId;
+
+/// Wrapper for CONFIG that allows one-time initialization
+pub struct ConfigCell {
+    initialized: AtomicBool,
+    value: UnsafeCell<Config>,
+}
+
+impl ConfigCell {
+    pub fn new(config: Config) -> Self {
+        ConfigCell {
+            initialized: AtomicBool::new(false),  // Start as uninitialized
+            value: UnsafeCell::new(config),
+        }
+    }
+
+    pub fn set(&self, config: Config) {
+        // Only allow setting if not yet initialized
+        if !self.initialized.swap(true, Ordering::SeqCst) {
+            unsafe {
+                *self.value.get() = config;
+            }
+            println!("CONFIG set successfully: cache_size={}", config.cache_size);
+        } else {
+            println!("CONFIG already initialized, ignoring new config");
+        }
+    }
+
+    pub fn get(&self) -> &Config {
+        unsafe { &*self.value.get() }
+    }
+}
+
+unsafe impl Send for ConfigCell {}
+unsafe impl Sync for ConfigCell {}
+
+lazy_static! {
+    /// The capacity of the data buffer.
+    pub static ref CONFIG: ConfigCell = ConfigCell::new(Config::default());
+}
 
 /// SwornDisk.
 pub struct SwornDisk<D: BlockSet> {
@@ -109,7 +151,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        config: Option<Config>,
     ) -> Result<Self> {
+        if let Some(cfg) = config {
+            CONFIG.set(cfg);
+        }
+
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
@@ -161,7 +208,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        config: Option<Config>,
     ) -> Result<Self> {
+        if let Some(cfg) = config {
+            CONFIG.set(cfg);
+        }
+        
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
@@ -806,7 +858,7 @@ mod tests {
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None,None)?;
         let num_rw = 1024;
 
         // Submit a write block I/O request
@@ -843,7 +895,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None,None)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);
