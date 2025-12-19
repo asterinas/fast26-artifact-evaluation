@@ -10,8 +10,9 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
-use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
+use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::layers::disk::config::Config;
+use crate::layers::disk::WAF_STATS;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
@@ -414,6 +415,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<()> {
+        // WAF Statistics: count all user write calls as logical writes
+        if CONFIG.get().stat_waf {
+            WAF_STATS.add_logical(buf.as_slice().len() as u64);
+        }
+
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
             let buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);

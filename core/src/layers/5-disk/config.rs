@@ -5,6 +5,7 @@ pub struct Config {
     pub cache_size: usize,
     pub two_level_caching: bool,
     pub delayed_reclamation: bool,
+    pub stat_waf: bool,
 }
 
 impl Default for Config {
@@ -13,6 +14,7 @@ impl Default for Config {
             cache_size: usize::MAX,
             two_level_caching: true,
             delayed_reclamation: true,
+            stat_waf: false,
         }
     }
 }

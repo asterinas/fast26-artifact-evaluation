@@ -140,9 +140,9 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         // Evenly distribute cache blocks across all SSTables, with a minimum threshold
         let cache_per_sst = (total_cache_blocks / MAX_SST_COUNT).max(MIN_CACHE_CAP);
 
-        println!("total_cache_bytes: {}", total_cache_bytes);
-        println!("total_cache_blocks: {}", total_cache_blocks);
-        println!("cache_blocks_per_sst: {}", cache_per_sst);
+        // println!("total_cache_bytes: {}", total_cache_bytes);
+        // println!("total_cache_blocks: {}", total_cache_blocks);
+        // println!("cache_blocks_per_sst: {}", cache_per_sst);
 
         cache_per_sst
     }

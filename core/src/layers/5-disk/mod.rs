@@ -36,6 +36,8 @@ mod block_alloc;
 mod data_buf;
 mod sworndisk;
 mod config;
+mod waf_stats;
 
 pub use self::sworndisk::{SwornDisk, CONFIG};
 pub use self::config::Config;
+pub use self::waf_stats::{WafStats, WAF_STATS};
