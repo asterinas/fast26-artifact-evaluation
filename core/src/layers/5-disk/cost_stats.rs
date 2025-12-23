@@ -1,6 +1,6 @@
 //! Cost statistics for read/write operations.
 
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 
 /// Cost statistics collector
@@ -382,45 +382,28 @@ pub fn print_all_cost_stats() {
     COST_L2.print();
 }
 
-// ============================================================================
-// Reset After Warmup Reads
-// ============================================================================
+/// Print cost statistics as JSON format for visualization
+pub fn print_cost_stats_json() {
+    let l3_stats = COST_L3.get_stats();
+    let l3_pct = l3_stats.get_percentage();
 
-/// Counter to track read requests
-static READ_COUNT: AtomicU64 = AtomicU64::new(0);
+    let l2_stats = COST_L2.get_stats();
+    let l2_pct = l2_stats.get_percentage();
 
-/// Flag to ensure we only reset once
-static COST_RESET_DONE: AtomicBool = AtomicBool::new(false);
-
-/// Reset threshold: FIO sends ~770 warmup reads, so reset at 800th read
-const RESET_AFTER_READS: u64 = 800;
-
-/// Count read operations and reset cost statistics after warmup phase.
-/// This is called at the start of read operations to exclude FIO layout/warmup overhead.
-/// Resets once at the 800th read, subsequent calls do nothing (idempotent).
-pub fn reset_cost_on_first_read() {
-    let count = READ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-
-    // Reset at exactly the 800th read
-    if count == RESET_AFTER_READS {
-        // Use compare_exchange to ensure only one thread resets
-        if COST_RESET_DONE.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst
-        ).is_ok() {
-            println!("========================================");
-            println!("Cost stats reset at read #{}", count);
-            println!("Excluding warmup phase from statistics");
-            println!("========================================");
-
-            // Reset all cost statistics
-            COST_L3.reset();
-            COST_L2.reset();
-            COST_STATS.reset();
-        }
-    }
+    println!("{{");
+    println!("  \"L3\": {{");
+    println!("    \"logical_block_table\": {:.2},", l3_pct.logical_block_table);
+    println!("    \"block_io\": {:.2},", l3_pct.block_io);
+    println!("    \"encryption\": {:.2},", l3_pct.encryption);
+    println!("    \"allocation\": {:.2}", l3_pct.allocation);
+    println!("  }},");
+    println!("  \"L2\": {{");
+    println!("    \"wal\": {:.2},", l2_pct.wal);
+    println!("    \"memtable\": {:.2},", l2_pct.memtable);
+    println!("    \"compaction\": {:.2},", l2_pct.compaction);
+    println!("    \"sstable_lookup\": {:.2}", l2_pct.sstable_lookup);
+    println!("  }}");
+    println!("}}");
 }
 
 

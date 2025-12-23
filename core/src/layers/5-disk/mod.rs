@@ -46,5 +46,5 @@ pub use self::cost_stats::{
     CostStats, COST_STATS,
     CostL3, CostL3Type, CostL3Stats, CostL3Percentage, COST_L3,
     CostL2, CostL2Type, CostL2Stats, CostL2Percentage, COST_L2,
-    CostTimer, print_all_cost_stats, reset_cost_on_first_read,
+    CostTimer, print_all_cost_stats, print_cost_stats_json,
 };

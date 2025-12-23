@@ -43,7 +43,7 @@ pub use self::layers::disk::{
     WAF_STATS, COST_STATS, CONFIG,
     COST_L3, CostL3Type,
     COST_L2, CostL2Type,
-    print_all_cost_stats, reset_cost_on_first_read,
+    print_all_cost_stats, print_cost_stats_json,
 };
 pub use self::os::{Aead, AeadKey, Rng};
 pub use self::util::{Aead as _, RandomInit, Rng as _};

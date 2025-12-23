@@ -28,7 +28,7 @@ use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::cell::UnsafeCell;
 use pod::Pod;
-use crate::{COST_L3, COST_L2, CostL3Type, reset_cost_on_first_read};
+use crate::{COST_L3, COST_L2, CostL3Type};
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -335,12 +335,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         debug_assert_eq!(buf.nblocks(), 1);
-
-        // Reset cost stats on first read to exclude layout overhead
-        if CONFIG.get().stat_cost {
-            reset_cost_on_first_read();
-        }
-
         // Search in `DataBuf` first
         if self.data_buf.get(RecordKey { lba }, &mut buf).is_some() {
             return Ok(());
@@ -383,11 +377,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn read_multi_blocks<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
-        // Reset cost stats on first read to exclude layout overhead
-        if CONFIG.get().stat_cost {
-            reset_cost_on_first_read();
-        }
-
         let mut buf_vec = BufMutVec::from_bufs(bufs);
         let nblocks = buf_vec.nblocks();
 
