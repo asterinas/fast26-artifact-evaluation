@@ -13,7 +13,7 @@ use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
 use crate::os::{spawn, BTreeMap, RwLock};
-use crate::prelude::*;
+use crate::{prelude::*, COST_L2, CostL2Type, CONFIG};
 use crate::tx::Tx;
 
 use core::hash::Hash;
@@ -186,23 +186,47 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     pub fn put(&self, key: K, value: V) -> Result<()> {
         let inner = &self.0;
         let record = (key, value);
-
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::WAL))
+        } else {
+            None
+        };
         // Write the record to WAL
         inner.wal_append_tx.append(&record)?;
+        drop(timer);
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::MemTable))
+        } else {
+            None
+        };
         // Put the record into `MemTable`
         let at_capacity = inner.memtable_manager.put(key, value);
+        drop(timer);
+
         if !at_capacity {
             return Ok(());
         }
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::WAL))
+        } else {
+            None
+        };
         // Commit WAL TX before compaction
         // TODO: Error handling: try twice or ignore
         let wal_id = inner.wal_append_tx.commit()?;
+        drop(timer);
 
         // Wait asynchronous compaction to finish
         // TODO: Error handling for compaction: try twice or become read-only
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::Compaction))
+        } else {
+            None
+        };
         inner.compactor.wait_compaction()?;
+        drop(timer);
 
         inner.memtable_manager.switch().unwrap();
 
@@ -218,8 +242,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     /// Do a compaction TX.
     /// The given `wal_id` is used to identify the WAL for discarding.
     fn do_compaction_tx(&self, wal_id: TxLogId) -> Result<()> {
+
         let inner = self.0.clone();
+        let stat_cost = CONFIG.get().stat_cost;
         let handle = spawn(move || -> Result<()> {
+            let timer = if stat_cost {
+                Some(COST_L2.time(CostL2Type::Compaction))
+            } else {
+                None
+            };
             // Do major compaction first if necessary
             if inner
                 .sst_manager
@@ -231,9 +262,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             // Do minor compaction
             inner.do_minor_compaction(wal_id)?;
-
+            drop(timer);
             Ok(())
         });
+
 
         // handle.join().unwrap()?; // synchronous
         self.0.compactor.record_handle(handle); // asynchronous
@@ -374,9 +406,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
     pub fn get(&self, key: &K) -> Result<V> {
         // 1. Search from MemTables
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::MemTable))
+        } else {
+            None
+        };
         if let Some(value) = self.memtable_manager.get(key) {
             return Ok(value);
         }
+        drop(timer);
 
         // 2. Search from SSTs (do Read TX)
         let value = self.do_read_tx(key)?;
@@ -385,7 +423,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     }
 
     pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> Result<()> {
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::MemTable))
+        } else {
+            None
+        };
         let is_completed = self.memtable_manager.get_range(range_query_ctx);
+        drop(timer);
         if is_completed {
             return Ok(());
         }
@@ -400,12 +444,30 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         // Wait asynchronous compaction to finish
         // TODO: Error handling for compaction: try twice or become read-only
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::Compaction))
+        } else {
+            None
+        };
         self.compactor.wait_compaction()?;
+        drop(timer);
 
         // TODO: Error handling for WAL: try twice or become read-only
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::WAL))
+        } else {
+            None
+        };
         self.wal_append_tx.sync(master_sync_id)?;
+        drop(timer);
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L2.time(CostL2Type::MemTable))
+        } else {
+            None
+        };
         self.memtable_manager.sync(master_sync_id);
+        drop(timer);
 
         // TODO: Error handling: try twice or ignore
         self.master_sync_id.increment()?;
@@ -417,9 +479,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     /// Read TX.
     fn do_read_tx(&self, key: &K) -> Result<V> {
         let mut tx = self.tx_log_store.new_tx();
+        let stat_cost = CONFIG.get().stat_cost;
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
+            let timer = if stat_cost {
+                Some(COST_L2.time(CostL2Type::SSTableLookup))
+            } else {
+                None
+            };
             let sst_manager = self.sst_manager.read();
 
             for (level, _bucket) in LsmLevel::iter() {
@@ -433,6 +501,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                     }
                 }
             }
+            drop(timer);
 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
@@ -450,9 +519,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     fn do_read_range_tx(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> Result<()> {
         debug_assert!(!range_query_ctx.is_completed());
         let mut tx = self.tx_log_store.new_tx();
+        let stat_cost = CONFIG.get().stat_cost;
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
+            let timer = if stat_cost {
+                Some(COST_L2.time(CostL2Type::SSTableLookup))
+            } else {
+                None
+            };
             let sst_manager = self.sst_manager.read();
             for (level, _bucket) in LsmLevel::iter() {
                 for (_id, sst) in sst_manager.list_level(level) {
@@ -467,7 +542,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                     }
                 }
             }
-
+            drop(timer);
             return_errno_with_msg!(NotFound, "target sst not found");
         });
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {

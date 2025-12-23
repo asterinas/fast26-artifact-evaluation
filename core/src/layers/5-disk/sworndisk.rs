@@ -12,7 +12,7 @@ use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::layers::disk::config::Config;
-use crate::layers::disk::WAF_STATS;
+use crate::layers::disk::{WAF_STATS, COST_STATS};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
@@ -28,6 +28,7 @@ use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::cell::UnsafeCell;
 use pod::Pod;
+use crate::{COST_L3, COST_L2, CostL3Type, reset_cost_on_first_read};
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -296,6 +297,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
+
         let nblocks = buf.nblocks();
 
         let res = if nblocks == 1 {
@@ -333,17 +335,40 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         debug_assert_eq!(buf.nblocks(), 1);
+
+        // Reset cost stats on first read to exclude layout overhead
+        if CONFIG.get().stat_cost {
+            reset_cost_on_first_read();
+        }
+
         // Search in `DataBuf` first
         if self.data_buf.get(RecordKey { lba }, &mut buf).is_some() {
             return Ok(());
         }
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::LogicalBlockTable))
+        } else {
+            None
+        };
         // Search in `TxLsmTree` then
         let value = self.logical_block_table.get(&RecordKey { lba })?;
+        drop(timer);
 
-        // Perform disk read and decryption
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::BlockIO))
+        } else {
+            None
+        };
         let mut cipher = Buf::alloc(1)?;
         self.user_data_disk.read(value.hba, cipher.as_mut())?;
+        drop(timer);
+
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::Encryption))
+        } else {
+            None
+        };
         Aead::new().decrypt(
             cipher.as_slice(),
             &value.key,
@@ -352,11 +377,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             &value.mac,
             buf.as_mut_slice(),
         )?;
+        drop(timer);
 
         Ok(())
     }
 
     fn read_multi_blocks<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
+        // Reset cost stats on first read to exclude layout overhead
+        if CONFIG.get().stat_cost {
+            reset_cost_on_first_read();
+        }
+
         let mut buf_vec = BufMutVec::from_bufs(bufs);
         let nblocks = buf_vec.nblocks();
 
@@ -377,8 +408,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::LogicalBlockTable))
+        } else {
+            None
+        };
         // Search in `TxLsmTree` then
         self.logical_block_table.get_range(&mut range_query_ctx)?;
+        drop(timer);
         // Allow empty read
         debug_assert!(range_query_ctx.is_completed());
 
@@ -392,11 +429,22 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         let mut cipher_buf = Buf::alloc(nblocks)?;
         let cipher_slice = cipher_buf.as_mut_slice();
         for record_batch in record_batches {
+            let timer = if CONFIG.get().stat_cost {
+                Some(COST_L3.time(CostL3Type::BlockIO))
+            } else {
+                None
+            };
             self.user_data_disk.read(
                 record_batch.first().unwrap().1.hba,
                 BufMut::try_from(&mut cipher_slice[..record_batch.len() * BLOCK_SIZE]).unwrap(),
             )?;
+            drop(timer);
 
+            let timer = if CONFIG.get().stat_cost {
+                Some(COST_L3.time(CostL3Type::Encryption))
+            } else {
+                None
+            };
             for (nth, (key, value)) in record_batch.iter().enumerate() {
                 Aead::new().decrypt(
                     &cipher_slice[nth * BLOCK_SIZE..(nth + 1) * BLOCK_SIZE],
@@ -407,6 +455,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                     buf_vec.nth_buf_mut_slice(key.lba - lba),
                 )?;
             }
+            drop(timer);
         }
 
         Ok(())
@@ -447,10 +496,16 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     fn flush_data_buf(&self) -> Result<()> {
         let records = self.write_blocks_from_data_buf()?;
         // Insert new records of data blocks to `TxLsmTree`
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::LogicalBlockTable))
+        } else {
+            None
+        };
         for (key, value) in records {
             // TODO: Error handling: Should dealloc the written blocks
             self.logical_block_table.put(key, value)?;
         }
+        drop(timer);
 
         self.data_buf.clear();
         Ok(())
@@ -464,19 +519,31 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         if num_write == 0 {
             return Ok(records);
         }
-
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::Allocation))
+        } else {
+            None
+        };
         // Allocate slots for data blocks
         let hbas = self
             .block_validity_table
             .alloc_batch(NonZeroUsize::new(num_write).unwrap())?;
         debug_assert_eq!(hbas.len(), num_write);
+        drop(timer);
         let hba_batches = hbas.group_by(|hba1, hba2| hba2 - hba1 == 1);
 
+
+       
         // Perform encryption and batch disk write
         let mut cipher_buf = Buf::alloc(num_write)?;
         let mut cipher_slice = cipher_buf.as_mut_slice();
         let mut nth = 0;
         for hba_batch in hba_batches {
+            let timer = if CONFIG.get().stat_cost {
+                Some(COST_L3.time(CostL3Type::Encryption))
+            } else {
+                None
+            };
             for (i, &hba) in hba_batch.iter().enumerate() {
                 let (lba, data_block) = &data_blocks[nth];
                 let key = Key::random();
@@ -491,11 +558,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 records.push((*lba, RecordValue { hba, key, mac }));
                 nth += 1;
             }
+            drop(timer);
 
+            let timer = if CONFIG.get().stat_cost {
+                Some(COST_L3.time(CostL3Type::BlockIO))
+            } else {
+                None
+            };
             self.user_data_disk.write(
                 *hba_batch.first().unwrap(),
                 BufRef::try_from(&cipher_slice[..hba_batch.len() * BLOCK_SIZE]).unwrap(),
             )?;
+            drop(timer);
             cipher_slice = &mut cipher_slice[hba_batch.len() * BLOCK_SIZE..];
         }
 
@@ -507,15 +581,29 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
+
         self.logical_block_table.sync()?;
 
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::Allocation))
+        } else {
+            None
+        };
         // XXX: May impact performance when there comes frequent syncs
         self.block_validity_table
             .do_compaction(&self.tx_log_store)?;
+        drop(timer);
 
         self.tx_log_store.sync()?;
 
-        self.user_data_disk.flush()
+        let timer = if CONFIG.get().stat_cost {
+            Some(COST_L3.time(CostL3Type::BlockIO))
+        } else {
+            None
+        };
+        self.user_data_disk.flush()?;
+        drop(timer);
+        Ok(())
     }
 
     /// Handle one block I/O request. Mark the request completed when finished,
