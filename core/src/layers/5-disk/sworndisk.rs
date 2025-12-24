@@ -12,7 +12,7 @@ use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::layers::disk::config::Config;
-use crate::layers::disk::{WAF_STATS, COST_STATS};
+use crate::layers::disk::WAF_STATS;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
@@ -491,6 +491,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             None
         };
         for (key, value) in records {
+
+            if !CONFIG.get().delayed_reclamation {
+                // ignore this error
+                let _ = self.logical_block_table.get(&key);
+            }
             // TODO: Error handling: Should dealloc the written blocks
             self.logical_block_table.put(key, value)?;
         }

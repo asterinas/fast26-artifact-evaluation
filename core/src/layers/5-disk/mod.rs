@@ -43,7 +43,6 @@ pub use self::sworndisk::{SwornDisk, CONFIG};
 pub use self::config::Config;
 pub use self::waf_stats::{WafStats, WAF_STATS};
 pub use self::cost_stats::{
-    CostStats, COST_STATS,
     CostL3, CostL3Type, CostL3Stats, CostL3Percentage, COST_L3,
     CostL2, CostL2Type, CostL2Stats, CostL2Percentage, COST_L2,
     CostTimer, print_all_cost_stats, print_cost_stats_json,

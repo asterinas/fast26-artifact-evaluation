@@ -3,89 +3,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 
-/// Cost statistics collector
-pub struct CostStats {
-    read_count: AtomicU64,
-    read_bytes: AtomicU64,
-    write_count: AtomicU64,
-    write_bytes: AtomicU64,
-}
 
-impl CostStats {
-    /// Create a new CostStats instance
-    pub const fn new() -> Self {
-        Self {
-            read_count: AtomicU64::new(0),
-            read_bytes: AtomicU64::new(0),
-            write_count: AtomicU64::new(0),
-            write_bytes: AtomicU64::new(0),
-        }
-    }
 
-    /// Add a read operation
-    pub fn add_read(&self, bytes: u64) {
-        self.read_count.fetch_add(1, Ordering::Relaxed);
-        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
 
-    /// Add a write operation
-    pub fn add_write(&self, bytes: u64) {
-        self.write_count.fetch_add(1, Ordering::Relaxed);
-        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Get total read operations count
-    pub fn get_read_count(&self) -> u64 {
-        self.read_count.load(Ordering::Relaxed)
-    }
-
-    /// Get total read bytes
-    pub fn get_read_bytes(&self) -> u64 {
-        self.read_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Get total write operations count
-    pub fn get_write_count(&self) -> u64 {
-        self.write_count.load(Ordering::Relaxed)
-    }
-
-    /// Get total write bytes
-    pub fn get_write_bytes(&self) -> u64 {
-        self.write_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Reset all statistics
-    pub fn reset(&self) {
-        self.read_count.store(0, Ordering::Relaxed);
-        self.read_bytes.store(0, Ordering::Relaxed);
-        self.write_count.store(0, Ordering::Relaxed);
-        self.write_bytes.store(0, Ordering::Relaxed);
-    }
-
-    /// Print statistics
-    pub fn print(&self) {
-        let read_count = self.get_read_count();
-        let read_bytes = self.get_read_bytes();
-        let write_count = self.get_write_count();
-        let write_bytes = self.get_write_bytes();
-
-        println!("==================== Cost Statistics ====================");
-        println!("  Read operations:  {} times", read_count);
-        println!("  Read bytes:       {} bytes ({:.2} MB)", read_bytes, read_bytes as f64 / 1024.0 / 1024.0);
-        println!("  Write operations: {} times", write_count);
-        println!("  Write bytes:      {} bytes ({:.2} MB)", write_bytes, write_bytes as f64 / 1024.0 / 1024.0);
-        println!("  Total operations: {} times", read_count + write_count);
-        println!("  Total bytes:      {} bytes ({:.2} MB)",
-                read_bytes + write_bytes,
-                (read_bytes + write_bytes) as f64 / 1024.0 / 1024.0);
-        println!("=========================================================");
-    }
-}
-
-// Global Cost statistics
-lazy_static! {
-    pub static ref COST_STATS: CostStats = CostStats::new();
-}
 
 // ============================================================================
 // Cost Timing Statistics (L3: Disk Layer, L2: LSM Tree Layer)

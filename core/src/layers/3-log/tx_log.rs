@@ -61,16 +61,17 @@
 use self::journaling::{AllEdit, AllState, Journal, JournalCompactPolicy};
 use super::chunk::{ChunkAlloc, ChunkAllocEdit, ChunkAllocState};
 use super::raw_log::{RawLog, RawLogId, RawLogStore, RawLogStoreEdit, RawLogStoreState};
-use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
+use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::layers::crypto::{CryptoLog, NodeCache, RootMhtMeta};
 use crate::layers::edit::{CompactPolicy, Edit, EditJournal, EditJournalMeta};
 use crate::layers::log::chunk::CHUNK_NBLOCKS;
 use crate::os::{AeadKey as Key, HashMap, HashSet, Mutex, Skcipher, SkcipherIv, SkcipherKey};
-use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxId, TxProvider};
 use crate::util::LazyDelete;
+use crate::{prelude::*, CONFIG};
 
 use core::any::Any;
+use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 use lru::LruCache;
 use pod::Pod;
@@ -395,6 +396,10 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     fn apply_log_caches(state: &mut State, current_tx: &mut CurrentTx<'_>) {
+        if !CONFIG.get().two_level_caching {
+            return;
+        }
+
         // Apply per-TX log cache
         current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
             if open_cache_table.open_table.is_empty() {
@@ -456,11 +461,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             let _ = open_log_table.open_table.insert(log_id, inner_log.clone());
         });
 
-        current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            let _ = open_cache_table
-                .open_table
-                .insert(log_id, CacheInner::new());
-        });
+        if CONFIG.get().two_level_caching {
+            current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+                let _ = open_cache_table
+                    .open_table
+                    .insert(log_id, CacheInner::new());
+            });
+        }
 
         Ok(Arc::new(TxLog {
             inner_log,
@@ -519,11 +526,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         };
 
         // Prepare cache before opening `CryptoLog`
-        current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            let _ = open_cache_table
-                .open_table
-                .insert(log_id, CacheInner::new());
-        });
+        if CONFIG.get().two_level_caching {
+            current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+                let _ = open_cache_table
+                    .open_table
+                    .insert(log_id, CacheInner::new());
+            });
+        }
 
         let bucket = log_entry.bucket.clone();
         let crypto_log = {
@@ -875,17 +884,19 @@ impl CryptoLogCache {
 
 impl NodeCache for CryptoLogCache {
     fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
-        let mut current = self.tx_provider.current();
+        if CONFIG.get().two_level_caching {
+            let mut current = self.tx_provider.current();
 
-        let value_opt = current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            open_cache_table
-                .open_table
-                .get_mut(&self.log_id)
-                .map(|open_cache| open_cache.lru_cache.get(&pos).cloned())
-                .flatten()
-        });
-        if value_opt.is_some() {
-            return value_opt;
+            let value_opt = current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+                open_cache_table
+                    .open_table
+                    .get_mut(&self.log_id)
+                    .map(|open_cache| open_cache.lru_cache.get(&pos).cloned())
+                    .flatten()
+            });
+            if value_opt.is_some() {
+                return value_opt;
+            }
         }
 
         let mut inner = self.inner.lock();
@@ -897,22 +908,45 @@ impl NodeCache for CryptoLogCache {
         pos: BlockId,
         value: Arc<dyn Any + Send + Sync>,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        let mut current = self.tx_provider.current();
+        if CONFIG.get().two_level_caching {
+            let mut current = self.tx_provider.current();
 
-        current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            debug_assert!(open_cache_table.open_table.contains_key(&self.log_id));
-            let open_cache = open_cache_table.open_table.get_mut(&self.log_id).unwrap();
-            open_cache.lru_cache.put(pos, value)
-        })
+            return current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+                debug_assert!(open_cache_table.open_table.contains_key(&self.log_id));
+                let open_cache = open_cache_table.open_table.get_mut(&self.log_id).unwrap();
+                open_cache.lru_cache.put(pos, value)
+            });
+        }
+
+        let mut inner = self.inner.lock();
+        inner.lru_cache.put(pos, value)
     }
 }
 
 impl CacheInner {
     pub fn new() -> Self {
-        // TODO: Give the cache a bound then test cache hit rate
+        let cap = Self::cache_capacity();
         Self {
-            lru_cache: LruCache::unbounded(),
+            lru_cache: LruCache::new(NonZeroUsize::new(cap).unwrap()),
         }
+    }
+
+    /// Calculate cache capacity (in blocks) per CryptoLog based on global config.
+    ///
+    /// Distributes the global cache_size (bytes) evenly across an estimated
+    /// maximum number of logs. Falls back to a default when cache_size is unset.
+    fn cache_capacity() -> usize {
+        const MAX_LOG_COUNT: usize = 64; // Conservative upper bound of concurrently cached logs
+        const MIN_CACHE_CAP: usize = 64; // Minimum blocks per log
+        const DEFAULT_CACHE_CAP: usize = 1024; // Legacy default when cache_size unset
+
+        let total_cache_bytes = CONFIG.get().cache_size;
+        if total_cache_bytes == usize::MAX {
+            return DEFAULT_CACHE_CAP;
+        }
+
+        let total_cache_blocks = total_cache_bytes / BLOCK_SIZE;
+        (total_cache_blocks / MAX_LOG_COUNT).max(MIN_CACHE_CAP)
     }
 }
 

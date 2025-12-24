@@ -5,7 +5,7 @@ use super::{RangeQueryCtx, RecordKey, RecordValue, SyncId, TxEventListener};
 use crate::layers::bio::{BlockSet, Buf, BufMut, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::Mutex;
-use crate::prelude::*;
+use crate::{prelude::*, CONFIG};
 
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -22,7 +22,7 @@ use pod::Pod;
 pub(super) struct SSTable<K, V> {
     id: TxLogId,
     footer: Footer<K>,
-    cache: Mutex<LruCache<BlockId, Arc<RecordBlock>>>,
+    cache: Option<Mutex<LruCache<BlockId, Arc<RecordBlock>>>>,
     phantom: PhantomData<(K, V)>,
 }
 
@@ -124,7 +124,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
 
         // Maximum number of SSTables: 100GB disk / 8GB per SSTable
         const MAX_SST_COUNT: usize = 13;
-        const MIN_CACHE_CAP: usize = 64;  // Minimum cache blocks per SSTable
+        const MIN_CACHE_CAP: usize = 64; // Minimum cache blocks per SSTable
 
         let total_cache_bytes = CONFIG.get().cache_size;
 
@@ -273,18 +273,24 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         target_pos: BlockId,
         tx_log_store: &Arc<TxLogStore<D>>,
     ) -> Result<Arc<RecordBlock>> {
-        let mut cache = self.cache.lock();
-        if let Some(cached_rb) = cache.get(&target_pos) {
-            Ok(cached_rb.clone())
-        } else {
-            let mut rb = RecordBlock::from_buf(vec![0; RECORD_BLOCK_SIZE]);
-            // TODO: Avoid opening the log on every call
-            let tx_log = tx_log_store.open_log(self.id, false)?;
-            tx_log.read(target_pos, BufMut::try_from(rb.as_mut_slice()).unwrap())?;
-            let rb = Arc::new(rb);
-            cache.put(target_pos, rb.clone());
-            Ok(rb)
+        if let Some(cache) = self.cache.as_ref() {
+            let mut cache = cache.lock();
+            if let Some(cached_rb) = cache.get(&target_pos) {
+                return Ok(cached_rb.clone());
+            }
         }
+
+        let mut rb = RecordBlock::from_buf(vec![0; RECORD_BLOCK_SIZE]);
+        // TODO: Avoid opening the log on every call
+        let tx_log = tx_log_store.open_log(self.id, false)?;
+        tx_log.read(target_pos, BufMut::try_from(rb.as_mut_slice()).unwrap())?;
+        let rb = Arc::new(rb);
+
+        if let Some(cache) = self.cache.as_ref() {
+            let mut cache = cache.lock();
+            cache.put(target_pos, rb.clone());
+        }
+        Ok(rb)
     }
 
     /// Return the iterator over this `SSTable`.
@@ -362,16 +368,24 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Self: 'a,
     {
         let cache_cap = Self::cache_capacity();
-        println!("cache_cap: {}", cache_cap);
+        println!("build a SST with cache_capacity: {}", cache_cap);
+
         let mut cache = LruCache::new(NonZeroUsize::new(cache_cap).unwrap());
+
         let (total_records, index_vec) =
             Self::build_record_blocks(records_iter, tx_log, &mut cache, event_listener)?;
         let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
 
+        let mut cache = if CONFIG.get().two_level_caching {
+            Some(Mutex::new(cache))
+        } else {
+            None
+        };
+
         Ok(Self {
             id: tx_log.id(),
             footer,
-            cache: Mutex::new(cache),
+            cache,
             phantom: PhantomData,
         })
     }
@@ -559,11 +573,17 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
             index.push(IndexEntry { pos, first, last })
         }
 
+        let cache = if CONFIG.get().two_level_caching {
+            Some(Mutex::new(cache))
+        } else {
+            None
+        };
+
         let footer = Footer { meta, index };
         Ok(Self {
             id: tx_log.id(),
             footer,
-            cache: Mutex::new(cache),
+            cache,
             phantom: PhantomData,
         })
     }

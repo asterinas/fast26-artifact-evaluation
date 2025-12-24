@@ -1,7 +1,7 @@
 use super::{Iv, Key, Mac};
 use crate::layers::bio::{BlockId, BlockLog, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::os::{Aead, HashMap, RwLock};
-use crate::prelude::*;
+use crate::{prelude::*, CONFIG};
 
 use core::any::Any;
 use core::cell::RefCell;
@@ -518,6 +518,10 @@ impl<L: BlockLog> MhtStorage<L> {
             let mac = Aead::new().encrypt(&node.0, &key, &Iv::new_zeroed(), &[], cipher)?;
 
             node_entries.push(MhtNodeEntry { pos, key, mac });
+            if !CONFIG.get().two_level_caching {
+                // When two-level caching is disabled, cache data nodes as well.
+                self.node_cache.put(pos, node.clone());
+            }
             pos += 1;
         }
 
@@ -547,6 +551,14 @@ impl<L: BlockLog> MhtStorage<L> {
 
     fn read_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
         debug_assert_eq!(node_buf.len(), BLOCK_SIZE);
+        if !CONFIG.get().two_level_caching {
+            if let Some(node) = self.node_cache.get(entry.pos) {
+                let data_node = node.downcast::<DataNode>().unwrap();
+                node_buf.copy_from_slice(&data_node.0);
+                return Ok(());
+            }
+        }
+
         let mut cipher = self.crypt_buf.cipher.borrow_mut();
 
         self.block_log.read(entry.pos, cipher.as_mut())?;
