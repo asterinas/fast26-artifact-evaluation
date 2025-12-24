@@ -11,14 +11,15 @@ use super::range_query_ctx::RangeQueryCtx;
 use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
+use crate::layers::disk::{SharedState, SharedStateRef};
 use crate::layers::log::{TxLogId, TxLogStore};
 use crate::os::{spawn, BTreeMap, RwLock};
-use crate::{prelude::*, COST_L2, CostL2Type, CONFIG};
 use crate::tx::Tx;
-
+use crate::{prelude::*, CostL2Type, CONFIG, COST_L2};
+use core::default;
 use core::hash::Hash;
 use core::ops::{Add, RangeInclusive, Sub};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use pod::Pod;
 
 /// Monotonic incrementing sync ID.
@@ -37,6 +38,7 @@ pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
     wal_append_tx: WalAppendTx<D>,
     compactor: Compactor<K, V>,
     tx_log_store: Arc<TxLogStore<D>>,
+    shared_state: SharedStateRef,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
     master_sync_id: MasterSyncId,
 }
@@ -146,12 +148,14 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: Arc<SharedState>,
     ) -> Result<Self> {
         let inner = TreeInner::format(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            shared_state,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -162,12 +166,14 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: Arc<SharedState>,
     ) -> Result<Self> {
         let inner = TreeInner::recover(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            shared_state,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -239,10 +245,33 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         self.0.sync()
     }
 
+    pub fn manual_compaction(&self) -> Result<()> {
+        #[cfg(not(feature = "linux"))]
+        debug!("Manual compaction started");
+        let inner = self.0.clone();
+        inner.shared_state.wait_for_background_gc();
+        inner.shared_state.start_compaction();
+        if inner
+            .sst_manager
+            .read()
+            .require_major_compaction(LsmLevel::L0)
+        {
+            inner.do_major_compaction(LsmLevel::L1)?;
+        }
+        if inner
+            .sst_manager
+            .read()
+            .require_major_compaction(LsmLevel::L1)
+        {
+            inner.do_major_compaction(LsmLevel::L2)?;
+        }
+        inner.shared_state.notify_compaction_finished();
+        Ok(())
+    }
+
     /// Do a compaction TX.
     /// The given `wal_id` is used to identify the WAL for discarding.
     fn do_compaction_tx(&self, wal_id: TxLogId) -> Result<()> {
-
         let inner = self.0.clone();
         let stat_cost = CONFIG.get().stat_cost;
         let handle = spawn(move || -> Result<()> {
@@ -251,6 +280,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
             } else {
                 None
             };
+            // Wait for background GC to finish
+            #[cfg(not(feature = "linux"))]
+            debug!("Compaction TX: waiting for background GC to finish");
+            inner.shared_state.wait_for_background_gc();
+            inner.shared_state.start_compaction();
             // Do major compaction first if necessary
             if inner
                 .sst_manager
@@ -263,9 +297,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
             // Do minor compaction
             inner.do_minor_compaction(wal_id)?;
             drop(timer);
+            // Notify background GC to proceed
+            inner.shared_state.notify_compaction_finished();
             Ok(())
         });
-
 
         // handle.join().unwrap()?; // synchronous
         self.0.compactor.record_handle(handle); // asynchronous
@@ -279,6 +314,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: Arc<SharedState>,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
         Ok(Self {
@@ -292,6 +328,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
+            shared_state,
             master_sync_id: MasterSyncId::new(sync_id_store, sync_id)?,
         })
     }
@@ -301,6 +338,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: Arc<SharedState>,
     ) -> Result<Self> {
         let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
         let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store)?;
@@ -322,6 +360,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
+            shared_state,
             master_sync_id,
         };
 
@@ -602,7 +641,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         self.sst_manager.write().insert(new_sst, LsmLevel::L0);
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Minor Compaction completed");
         Ok(())
     }
 
@@ -702,7 +741,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         );
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Major Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Major Compaction completed");
 
         // Continue to do major compaction if necessary
         if self.sst_manager.read().require_major_compaction(to_level) {
@@ -846,8 +885,14 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TxLsmTree
     }
 }
 
+impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Clone for TxLsmTree<K, V, D> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 4;
+    const LEVEL0_RATIO: u16 = 1;
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;
@@ -1000,10 +1045,15 @@ mod tests {
     use super::super::RangeQueryCtx;
     use super::*;
     use crate::{
-        layers::bio::{Buf, MemDisk},
-        os::AeadKey as Key,
-        os::AeadMac as Mac,
+        layers::{
+            bio::{Buf, MemDisk},
+            disk::SharedState,
+            log::TxLogStore,
+            lsm::wal::BUCKET_WAL,
+        },
+        os::{AeadKey as Key, AeadMac as Mac},
     };
+    use std::sync::Arc;
 
     struct Factory;
     struct Listener;
@@ -1042,15 +1092,27 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
-        let nblocks = 102400;
+        let nblocks = 204800;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
-        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> =
-            TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None, None)?;
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::format(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            Arc::new(SharedState::new()),
+        )?;
 
         // Put sufficient records which can trigger compaction before a sync command
         let cap = MEMTABLE_CAPACITY;
         let start = 0;
+        let col_key = 500;
+        let col_val = Value {
+            hba: col_key as BlockId,
+            key: Key::random(),
+            mac: Mac::random(),
+        };
+        tx_lsm_tree.put(col_key, col_val)?;
         for i in start..start + cap {
             let (k, v) = (
                 i as BlockId,
@@ -1091,8 +1153,13 @@ mod tests {
 
         // Recover the `TxLsmTree`, all unsynced records should be discarded
         drop(tx_lsm_tree);
-        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> =
-            TxLsmTree::recover(tx_log_store.clone(), Arc::new(Factory), None, None)?;
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::recover(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            Arc::new(SharedState::new()),
+        )?;
 
         assert!(tx_lsm_tree.get(&(600 + cap)).is_err());
 

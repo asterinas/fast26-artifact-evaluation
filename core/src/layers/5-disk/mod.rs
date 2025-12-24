@@ -33,17 +33,22 @@
 
 mod bio;
 mod block_alloc;
-mod data_buf;
-mod sworndisk;
 mod config;
-mod waf_stats;
 mod cost_stats;
+mod data_buf;
+mod dealloc_block;
+mod gc;
+mod segment;
+mod sworndisk;
+mod waf_stats;
 
-pub use self::sworndisk::{SwornDisk, CONFIG};
 pub use self::config::Config;
-pub use self::waf_stats::{WafStats, WAF_STATS};
 pub use self::cost_stats::{
-    CostL3, CostL3Type, CostL3Stats, CostL3Percentage, COST_L3,
-    CostL2, CostL2Type, CostL2Stats, CostL2Percentage, COST_L2,
-    CostTimer, print_all_cost_stats, print_cost_stats_json,
+    print_all_cost_stats, print_cost_stats_json, CostL2Type, CostL3Type, COST_L2, COST_L3,
 };
+pub use self::gc::{
+    GreedyVictimPolicy, LoopScanVictimPolicy, ReverseKey, ReverseValue, SharedState,
+    SharedStateRef, VictimPolicy,
+};
+pub use self::sworndisk::{SwornDisk, CONFIG};
+pub use self::waf_stats::{WafStats, WAF_STATS};

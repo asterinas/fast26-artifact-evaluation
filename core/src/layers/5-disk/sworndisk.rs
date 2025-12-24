@@ -10,25 +10,35 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
+use super::dealloc_block::DeallocTable;
+use super::gc::{
+    GcWorker, ReverseKey, ReverseValue, SharedStateRef, VictimPolicy, VictimPolicyRef,
+};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 use crate::layers::disk::config::Config;
+use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::disk::WAF_STATS;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
     TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
+use crate::os::{
+    Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
+};
 use crate::prelude::*;
 use crate::tx::Tx;
 
-use lazy_static::lazy_static;
+use crate::{CostL3Type, COST_L2, COST_L3};
+use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use lazy_static::lazy_static;
 use pod::Pod;
-use crate::{COST_L3, COST_L2, CostL3Type};
+use spin::Mutex;
+use std::thread;
+use time::Time;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -44,7 +54,7 @@ pub struct ConfigCell {
 impl ConfigCell {
     pub fn new(config: Config) -> Self {
         ConfigCell {
-            initialized: AtomicBool::new(false),  // Start as uninitialized
+            initialized: AtomicBool::new(false), // Start as uninitialized
             value: UnsafeCell::new(config),
         }
     }
@@ -85,8 +95,12 @@ struct DiskInner<D: BlockSet> {
     bio_req_queue: BioReqQueue,
     /// A `TxLsmTree` to store metadata of the logical blocks.
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
+    /// A reverse index table that map HBA to LBA.
+    reverse_index_table: Option<TxLsmTree<ReverseKey, ReverseValue, D>>,
+    /// A reverse index table that map HBA to LBA.
+    dealloc_table: Arc<DeallocTable>,
     /// The underlying disk where user data is stored.
-    user_data_disk: D,
+    user_data_disk: Arc<D>,
     /// Manage space of the data disk.
     block_validity_table: Arc<AllocTable>,
     /// TX log store for managing logs in `TxLsmTree` and block alloc logs.
@@ -99,6 +113,10 @@ struct DiskInner<D: BlockSet> {
     is_dropped: AtomicBool,
     /// Scope lock for control write and sync operation.
     write_sync_region: RwLock<()>,
+    /// Shared state for background GC.
+    shared_state: SharedStateRef,
+    /// Whether the disk is active.
+    is_active: Arc<AtomicBool>,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -154,6 +172,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         config: Option<Config>,
+        enable_gc: bool,
+        victim_policy_ref: Option<VictimPolicyRef>,
     ) -> Result<Self> {
         if let Some(cfg) = config {
             CONFIG.set(cfg);
@@ -161,20 +181,53 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
-
+        let reverse_index_disk = Self::subdisk_for_reverse_index_table(&disk)?;
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
+
+        let shared_state = Arc::new(SharedState::new());
+
+        let (dealloc_table, reverse_index_table) = if enable_gc {
+            let reverse_index_tx_log_store =
+                Arc::new(TxLogStore::format(reverse_index_disk, root_key.clone())?);
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                Some(TxLsmTree::format(
+                    reverse_index_tx_log_store,
+                    Arc::new(EmptyFactory),
+                    None,
+                    sync_id_store.clone(),
+                    shared_state.clone(),
+                )?),
+            )
+        } else {
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                None,
+            )
+        };
+
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            dealloc_table.clone(),
         ));
 
         let logical_block_table = {
             let table = block_validity_table.clone();
+            let dealloc_table = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                if dealloc_table.has_deallocated(record.value().hba) {
+                    dealloc_table.finish_deallocated(record.value().hba);
+                    return;
+                }
                 table.set_deallocated(record.value().hba);
             };
             TxLsmTree::format(
@@ -182,22 +235,38 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                shared_state.clone(),
             )?
         };
 
-        let new_self = Self {
-            inner: Arc::new(DiskInner {
-                bio_req_queue: BioReqQueue::new(),
-                logical_block_table,
-                user_data_disk: data_disk,
-                block_validity_table,
-                tx_log_store,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
-                root_key,
-                is_dropped: AtomicBool::new(false),
-                write_sync_region: RwLock::new(()),
-            }),
-        };
+        let inner = Arc::new(DiskInner {
+            bio_req_queue: BioReqQueue::new(),
+            logical_block_table,
+            reverse_index_table,
+            dealloc_table,
+            user_data_disk: Arc::new(data_disk),
+            block_validity_table,
+            tx_log_store,
+            data_buf: DataBuf::new(DATA_BUF_CAP),
+            root_key,
+            is_dropped: AtomicBool::new(false),
+            write_sync_region: RwLock::new(()),
+            shared_state,
+            is_active: Arc::new(AtomicBool::new(true)),
+        });
+        if enable_gc {
+            let gc_worker = match victim_policy_ref {
+                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
+                None => {
+                    // use GreedyVictimPolicy by default
+                    let policy = Arc::new(GreedyVictimPolicy {});
+                    inner.create_gc_worker(policy)?
+                }
+            };
+            thread::spawn(move || gc_worker.run());
+        }
+
+        let new_self = Self { inner };
 
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk] Created successfully! {:?}", &new_self);
@@ -209,13 +278,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     pub fn open(
         disk: D,
         root_key: Key,
+        victim_policy_ref: Option<VictimPolicyRef>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         config: Option<Config>,
+        enable_gc: bool,
     ) -> Result<Self> {
         if let Some(cfg) = config {
             CONFIG.set(cfg);
         }
-        
+
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
@@ -224,15 +295,45 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
             &tx_log_store,
         )?);
+
+        let shared_state = Arc::new(SharedState::new());
+
+        let (dealloc_table, reverse_index_table) = if enable_gc {
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                Some(TxLsmTree::format(
+                    tx_log_store.clone(),
+                    Arc::new(EmptyFactory),
+                    None,
+                    sync_id_store.clone(),
+                    shared_state.clone(),
+                )?),
+            )
+        } else {
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                None,
+            )
+        };
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            dealloc_table.clone(),
         ));
 
         let logical_block_table = {
             let table = block_validity_table.clone();
+            let rit = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
-                // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                //  Deallocate the host block while the corresponding record is dropped in `MemTable`
+                if rit.has_deallocated(record.value().hba) {
+                    rit.finish_deallocated(record.value().hba);
+                    return;
+                }
                 table.set_deallocated(record.value().hba);
             };
             TxLsmTree::recover(
@@ -240,22 +341,39 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                shared_state.clone(),
             )?
         };
 
-        let opened_self = Self {
-            inner: Arc::new(DiskInner {
-                bio_req_queue: BioReqQueue::new(),
-                logical_block_table,
-                user_data_disk: data_disk,
-                block_validity_table,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
-                tx_log_store,
-                root_key,
-                is_dropped: AtomicBool::new(false),
-                write_sync_region: RwLock::new(()),
-            }),
-        };
+        let inner = Arc::new(DiskInner {
+            bio_req_queue: BioReqQueue::new(),
+            logical_block_table,
+            reverse_index_table,
+            dealloc_table,
+            user_data_disk: Arc::new(data_disk),
+            block_validity_table,
+            data_buf: DataBuf::new(DATA_BUF_CAP),
+            tx_log_store,
+            root_key,
+            is_dropped: AtomicBool::new(false),
+            write_sync_region: RwLock::new(()),
+            shared_state,
+            is_active: Arc::new(AtomicBool::new(true)),
+        });
+
+        if enable_gc {
+            let gc_worker = match victim_policy_ref {
+                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
+                None => {
+                    // use GreedyVictimPolicy by default
+                    let policy = Arc::new(GreedyVictimPolicy {});
+                    inner.create_gc_worker(policy)?
+                }
+            };
+            thread::spawn(move || gc_worker.run());
+        }
+
+        let opened_self = Self { inner };
 
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk] Opened successfully! {:?}", &opened_self);
@@ -286,7 +404,20 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 
     fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
-        disk.subset(disk.nblocks() * 15 / 16..disk.nblocks()) // TBD
+        disk.subset(disk.nblocks() * 15 / 16..disk.nblocks() * 31 / 32) // TBD
+    }
+
+    fn subdisk_for_reverse_index_table(disk: &D) -> Result<D> {
+        disk.subset(disk.nblocks() * 31 / 32..disk.nblocks()) // TBD
+    }
+
+    // Create a gc worker but not launch, just for test
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
+        use super::gc::VictimPolicyRef;
+
+        self.inner.create_gc_worker(policy_ref)
     }
 }
 
@@ -297,7 +428,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
-
         let nblocks = buf.nblocks();
 
         let res = if nblocks == 1 {
@@ -345,6 +475,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         } else {
             None
         };
+        self.wait_for_background_gc();
         // Search in `TxLsmTree` then
         let value = self.logical_block_table.get(&RecordKey { lba })?;
         drop(timer);
@@ -396,6 +527,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         if range_query_ctx.is_completed() {
             return Ok(());
         }
+        self.wait_for_background_gc();
 
         let timer = if CONFIG.get().stat_cost {
             Some(COST_L3.time(CostL3Type::LogicalBlockTable))
@@ -465,6 +597,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             // Flush all data blocks in `DataBuf` to disk if it's full
             if buf_at_capacity {
                 // TODO: Error handling: Should discard current write in `DataBuf`
+                // flush_data_buf will wait for background GC to finish
                 self.flush_data_buf()?;
             }
             lba += 1;
@@ -483,24 +616,42 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn flush_data_buf(&self) -> Result<()> {
-        let records = self.write_blocks_from_data_buf()?;
-        // Insert new records of data blocks to `TxLsmTree`
+        self.wait_for_background_gc();
+
+        let mut ret = self.write_blocks_from_data_buf();
+
+        if let Err(e) = ret.as_ref() {
+            if e.errno() == OutOfDisk {
+                self.logical_block_table.manual_compaction()?;
+                // try write again
+                ret = self.write_blocks_from_data_buf();
+            }
+        }
+
+        let records = ret?;
+
         let timer = if CONFIG.get().stat_cost {
             Some(COST_L3.time(CostL3Type::LogicalBlockTable))
         } else {
             None
         };
-        for (key, value) in records {
-
+        // Insert new records of data blocks to `TxLsmTree`
+        for (key, value) in records.iter() {
             if !CONFIG.get().delayed_reclamation {
                 // ignore this error
                 let _ = self.logical_block_table.get(&key);
             }
             // TODO: Error handling: Should dealloc the written blocks
-            self.logical_block_table.put(key, value)?;
+            self.logical_block_table.put(key.clone(), value.clone())?;
+            if let Some(reverse_index_table) = &self.reverse_index_table {
+                let reverse_index_key = ReverseKey { hba: value.hba };
+                let reverse_index_value = ReverseValue { lba: key.lba };
+                reverse_index_table.put(reverse_index_key, reverse_index_value)?;
+            }
         }
-        drop(timer);
 
+        drop(timer);
+        self.is_active.store(true, Ordering::Release);
         self.data_buf.clear();
         Ok(())
     }
@@ -526,8 +677,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         drop(timer);
         let hba_batches = hbas.group_by(|hba1, hba2| hba2 - hba1 == 1);
 
-
-       
         // Perform encryption and batch disk write
         let mut cipher_buf = Buf::alloc(num_write)?;
         let mut cipher_slice = cipher_buf.as_mut_slice();
@@ -572,11 +721,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        // flush_data_buf will wait for background GC to finish
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
-
-        self.logical_block_table.sync()?;
+        // self.logical_block_table.sync()?;
 
         let timer = if CONFIG.get().stat_cost {
             Some(COST_L3.time(CostL3Type::Allocation))
@@ -611,6 +760,22 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         req.complete(res.clone());
         res
+    }
+
+    pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
+        // Safety: `reverse_index_table` is not None when enable_gc is true
+        let gc_worker = GcWorker::new(
+            policy_ref,
+            self.logical_block_table.clone(),
+            self.reverse_index_table.clone().unwrap(),
+            self.dealloc_table.clone(),
+            self.tx_log_store.clone(),
+            self.block_validity_table.clone(),
+            self.user_data_disk.clone(),
+            self.shared_state.clone(),
+            self.is_active.clone(),
+        );
+        Ok(gc_worker)
     }
 
     /// Handle a read I/O request.
@@ -656,6 +821,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     fn do_sync(&self, req: &BioReq) -> BioResp {
         debug_assert_eq!(req.type_(), BioType::Sync);
         self.sync()
+    }
+
+    // TODO: Currently, Background GC will block foreground I/O requests, but background gc will be launched when some foreground I/O requests remain running.
+    // this might cause some issue
+
+    // GcWorker will touch block_validity_table, logical_block_table and reverse_index_table and user_data_disk.
+    // In the stop the world manner. to maximize the concurrency, we should call this function after accessing data_buf and before accessing these data structures.
+    // To simplify the implementation, we should only call this function in some fn related to accessing these data structures directly.
+    // E.g. fn flush_data_buf(), read_one_block(), read_multi_blocks()
+    fn wait_for_background_gc(&self) {
+        self.shared_state.wait_for_background_gc();
     }
 }
 
@@ -716,11 +892,20 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_table: Arc<AllocTable>,
+    dealloc_table: Arc<DeallocTable>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
-    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>) -> Self {
-        Self { store, alloc_table }
+    fn new(
+        store: Arc<TxLogStore<D>>,
+        alloc_table: Arc<AllocTable>,
+        reverse_index_table: Arc<DeallocTable>,
+    ) -> Self {
+        Self {
+            store,
+            alloc_table,
+            dealloc_table: reverse_index_table,
+        }
     }
 }
 
@@ -737,21 +922,52 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
                 self.alloc_table.clone(),
                 self.store.clone(),
             )),
+            self.dealloc_table.clone(),
         ))
     }
+}
+
+struct EmptyFactory;
+struct EmptyListener;
+
+impl<K, V> TxEventListenerFactory<K, V> for EmptyFactory {
+    fn new_event_listener(&self, _tx_type: TxType) -> Arc<dyn TxEventListener<K, V>> {
+        Arc::new(EmptyListener)
+    }
+}
+impl<K, V> TxEventListener<K, V> for EmptyListener {
+    fn on_add_record(&self, _record: &dyn AsKV<K, V>) -> Result<()> {
+        Ok(())
+    }
+    fn on_drop_record(&self, _record: &dyn AsKV<K, V>) -> Result<()> {
+        Ok(())
+    }
+    fn on_tx_begin(&self, _tx: &mut Tx) -> Result<()> {
+        Ok(())
+    }
+    fn on_tx_precommit(&self, _tx: &mut Tx) -> Result<()> {
+        Ok(())
+    }
+    fn on_tx_commit(&self) {}
 }
 
 /// Event listener for `TxLsmTree`.
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
+    dealloc_table: Arc<DeallocTable>,
 }
 
 impl<D> TxLsmTreeListener<D> {
-    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>) -> Self {
+    fn new(
+        tx_type: TxType,
+        block_alloc: Arc<BlockAlloc<D>>,
+        reverse_index_table: Arc<DeallocTable>,
+    ) -> Self {
         Self {
             tx_type,
             block_alloc,
+            dealloc_table: reverse_index_table,
         }
     }
 }
@@ -778,6 +994,10 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
                 unreachable!();
             }
             TxType::Compaction { .. } | TxType::Migration => {
+                if self.dealloc_table.has_deallocated(record.value().hba) {
+                    self.dealloc_table.finish_deallocated(record.value().hba);
+                    return Ok(());
+                }
                 self.block_alloc.dealloc_block(record.value().hba)
             }
         }
@@ -942,14 +1162,14 @@ mod tests {
 
     #[test]
     fn sworndisk_fns() -> Result<()> {
-        let nblocks = 64 * 1024;
+        let nblocks = 128 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None,None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, None, false, None)?;
         let num_rw = 1024;
 
-        // Submit a write block I/O request
+        // // Submit a write block I/O request
         let mut wbuf = Buf::alloc(num_rw)?;
         let bufs = {
             let mut bufs = Vec::with_capacity(num_rw);
@@ -971,7 +1191,7 @@ mod tests {
             .build();
         sworndisk.submit_bio_sync(bio_req)?;
 
-        // Sync the `SwornDisk` then do some reads
+        // // Sync the `SwornDisk` then do some reads
         sworndisk.submit_bio_sync(BioReqBuilder::new(BioType::Sync).build())?;
 
         let mut rbuf = Buf::alloc(1)?;
@@ -983,7 +1203,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None,None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None, false, None)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);

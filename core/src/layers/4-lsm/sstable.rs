@@ -636,7 +636,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockQueryIter<'_, K, V> {
         let buf_slice = &self.block.buf;
         let (k_size, v_size) = (SSTable::<K, V>::K_SIZE, SSTable::<K, V>::V_SIZE);
 
-        if offset + SSTable::<K, V>::MIN_RECORD_SIZE > RECORD_BLOCK_SIZE {
+        if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
             return None;
         }
 
@@ -693,7 +693,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
         );
 
         let (key, value_ex) = loop {
-            if offset + SSTable::<K, V>::MIN_RECORD_SIZE > RECORD_BLOCK_SIZE {
+            if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
                 return None;
             }
 

@@ -1,8 +1,9 @@
 //! Block allocation.
+use super::segment::{self, recover_segment_table, Segment, SegmentId, SEGMENT_SIZE};
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
-use crate::os::{BTreeMap, Mutex};
+use crate::os::{BTreeMap, Condvar, CvarMutex, Mutex};
 use crate::prelude::*;
 use crate::util::BitMap;
 
@@ -12,21 +13,18 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 
-// TODO: Put them into os module
-#[cfg(feature = "occlum")]
-use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};
-#[cfg(feature = "std")]
-use std::sync::{Condvar, Mutex as CvarMutex};
-
 /// The bucket name of block validity table.
 const BUCKET_BLOCK_VALIDITY_TABLE: &str = "BVT";
 /// The bucket name of block alloc/dealloc log.
 const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
+/// The bucket name of segment table.
+const BUCKET_SEGMENT_TABLE: &str = "SEG";
 
 /// Block validity table. Global allocator for `SwornDisk`,
 /// which manages validities of user data blocks.
 pub(super) struct AllocTable {
-    bitmap: Mutex<BitMap>,
+    bitmap: Arc<Mutex<BitMap>>,
+    segment_table: Vec<Segment>,
     next_avail: AtomicUsize,
     nblocks: NonZeroUsize,
     is_dirty: AtomicBool,
@@ -47,7 +45,7 @@ pub(super) struct BlockAlloc<D> {
 /// Incremental diff of block validity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
-enum AllocDiff {
+pub(super) enum AllocDiff {
     Alloc = 3,
     Dealloc = 7,
     Invalid,
@@ -57,8 +55,16 @@ const DIFF_RECORD_SIZE: usize = size_of::<AllocDiff>() + size_of::<Hba>();
 impl AllocTable {
     /// Create a new `AllocTable` given the total number of blocks.
     pub fn new(nblocks: NonZeroUsize) -> Self {
+        let total_blocks = nblocks.get();
+        let segment_nums = total_blocks / SEGMENT_SIZE;
+        let mut segment_table = Vec::with_capacity(segment_nums);
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, nblocks.get())));
+        for id in 0..segment_nums {
+            segment_table.push(Segment::new(id, SEGMENT_SIZE, bitmap.clone()));
+        }
         Self {
-            bitmap: Mutex::new(BitMap::repeat(true, nblocks.get())),
+            bitmap,
+            segment_table,
             next_avail: AtomicUsize::new(0),
             nblocks,
             is_dirty: AtomicBool::new(false),
@@ -80,6 +86,9 @@ impl AllocTable {
         };
         bitmap.set(hba, false);
 
+        let segment_id = hba / SEGMENT_SIZE;
+        self.segment_table[segment_id].mark_alloc();
+
         self.next_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
     }
@@ -89,14 +98,26 @@ impl AllocTable {
     pub fn alloc_batch(&self, count: NonZeroUsize) -> Result<Vec<Hba>> {
         let cnt = count.get();
         let mut num_free = self.num_free.lock().unwrap();
+        if *num_free < cnt {
+            return Err(Error::with_msg(OutOfDisk, "no free slots"));
+        }
         while *num_free < cnt {
             // TODO: May not be woken, may require manual triggering of a compaction in L4
+            debug!("num_free < cnt, require compaction");
             num_free = self.cvar.wait(num_free).unwrap();
         }
         debug_assert!(*num_free >= cnt);
 
-        let hbas = self.do_alloc_batch(count).unwrap();
+        let Some(hbas) = self.do_alloc_batch(count) else {
+            return_errno_with_msg!(OutOfDisk, "allocate blocks failed");
+        };
         debug_assert_eq!(hbas.len(), cnt);
+
+        // Mark hbas allocation in SegmentTable
+        hbas.iter().for_each(|hba| {
+            let segment_id = *hba / SEGMENT_SIZE;
+            self.segment_table[segment_id].mark_alloc();
+        });
 
         *num_free -= cnt;
         let _ = self
@@ -134,6 +155,29 @@ impl AllocTable {
         nblocks: NonZeroUsize,
         store: &Arc<TxLogStore<D>>,
     ) -> Result<Self> {
+        let total_blocks = nblocks.get();
+        let segment_nums = total_blocks / SEGMENT_SIZE;
+
+        let recover_segment_table_from_log = |bitmap: Arc<Mutex<BitMap>>| -> Result<Vec<Segment>> {
+            let seg_log_res = store.open_log_in(BUCKET_SEGMENT_TABLE);
+            let segment_table = match seg_log_res {
+                Ok(seg_log) => {
+                    let mut buf = Buf::alloc(seg_log.nblocks())?;
+                    seg_log.read(0 as BlockId, buf.as_mut())?;
+                    recover_segment_table(segment_nums, buf.as_slice(), bitmap)?
+                }
+                Err(e) => {
+                    if e.errno() != NotFound {
+                        return Err(e);
+                    }
+                    (0..segment_nums)
+                        .map(|id| Segment::new(id, SEGMENT_SIZE, bitmap.clone()))
+                        .collect()
+                }
+            };
+            Ok(segment_table)
+        };
+
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {
             // Recover the block validity table from `BVT` log first
@@ -161,8 +205,12 @@ impl AllocTable {
             {
                 let next_avail = bitmap.first_one(0).unwrap_or(0);
                 let num_free = bitmap.count_ones();
+                // TODO: persistent segment_table and recover from it
+                let bitmap_ref = Arc::new(Mutex::new(bitmap));
+                let segment_table = recover_segment_table_from_log(bitmap_ref.clone())?;
                 return Ok(Self {
-                    bitmap: Mutex::new(bitmap),
+                    bitmap: bitmap_ref,
+                    segment_table: segment_table,
                     next_avail: AtomicUsize::new(next_avail),
                     nblocks,
                     is_dirty: AtomicBool::new(false),
@@ -204,9 +252,12 @@ impl AllocTable {
             }
             let next_avail = bitmap.first_one(0).unwrap_or(0);
             let num_free = bitmap.count_ones();
-
+            let bitmap_ref = Arc::new(Mutex::new(bitmap));
+            let segment_table = recover_segment_table_from_log(bitmap_ref.clone())?;
+            // TODO: persistent segment_table and recover from it
             Ok(Self {
-                bitmap: Mutex::new(bitmap),
+                bitmap: bitmap_ref,
+                segment_table,
                 next_avail: AtomicUsize::new(next_avail),
                 nblocks,
                 is_dirty: AtomicBool::new(false),
@@ -239,6 +290,22 @@ impl AllocTable {
         ser_buf.resize(align_up(ser_len, BLOCK_SIZE), 0);
         drop(bitmap);
 
+        let segment_table_len = self.segment_table.len();
+        // Serialize the segment table, [valid_block, free_space]
+        // Persist the serialized segment table to `SEG` log
+        let mut ser_seg_buf = vec![0; Segment::ser_size() * segment_table_len];
+        let mut ser_len = 0;
+        self.segment_table
+            .iter()
+            .enumerate()
+            .try_for_each(|(idx, segment)| {
+                let offset = idx * Segment::ser_size();
+                let segment_buf = &mut ser_seg_buf[offset..offset + Segment::ser_size()];
+                ser_len += segment.to_slice(segment_buf)?;
+                Ok::<_, Error>(())
+            })?;
+
+        ser_seg_buf.resize(align_up(ser_len, BLOCK_SIZE), 0);
         // Persist the serialized block validity table to `BVT` log
         // and GC any old `BVT` logs and `BAL` logs
         let mut tx = store.new_tx();
@@ -249,8 +316,17 @@ impl AllocTable {
                 }
             }
 
+            if let Ok(seg_log_ids) = store.list_logs_in(BUCKET_SEGMENT_TABLE) {
+                for seg_log_id in seg_log_ids {
+                    store.delete_log(seg_log_id)?;
+                }
+            }
+
             let bvt_log = store.create_log(BUCKET_BLOCK_VALIDITY_TABLE)?;
             bvt_log.append(BufRef::try_from(&ser_buf[..]).unwrap())?;
+
+            let seg_log = store.create_log(BUCKET_SEGMENT_TABLE)?;
+            seg_log.append(BufRef::try_from(&ser_seg_buf[..]).unwrap())?;
 
             if let Ok(bal_log_ids) = store.list_logs_in(BUCKET_BLOCK_ALLOC_LOG) {
                 for bal_log_id in bal_log_ids {
@@ -269,16 +345,47 @@ impl AllocTable {
         Ok(())
     }
 
+    // Migrate a batch of blocks to another segment.
+    // the blocks has been marked as allocated before, so the total num_free will not be decreased
+    pub fn migrate_batch(&self, hbas: &[Hba]) {
+        let mut bitmap = self.bitmap.lock();
+        hbas.iter().for_each(|hba| {
+            let segment_id = *hba / SEGMENT_SIZE;
+            self.segment_table[segment_id].mark_alloc();
+            bitmap.set(*hba, false);
+        });
+    }
+
     /// Mark a specific slot deallocated.
     pub fn set_deallocated(&self, nth: usize) {
         let mut num_free = self.num_free.lock().unwrap();
         self.bitmap.lock().set(nth, true);
+
+        let segment_id = nth / SEGMENT_SIZE;
+        self.segment_table[segment_id].mark_deallocated();
 
         *num_free += 1;
         const AVG_ALLOC_COUNT: usize = 1024;
         if *num_free >= AVG_ALLOC_COUNT {
             self.cvar.notify_one();
         }
+    }
+
+    // GC will deallocate out-of-date blocks before compaction
+    // discard these blocks and increase num_free
+    pub fn clear_segment(&self, segment_id: SegmentId, discard_count: usize) {
+        *self.num_free.lock().unwrap() += discard_count;
+        let mut bitmap = self.bitmap.lock();
+        let begin_hba = segment_id * SEGMENT_SIZE;
+        let end_hba = begin_hba + SEGMENT_SIZE;
+        for hba in begin_hba..end_hba {
+            bitmap.set(hba, true);
+        }
+        self.segment_table[segment_id].clear_segment();
+    }
+
+    pub fn get_segment_table_ref(&self) -> &[Segment] {
+        &self.segment_table
     }
 }
 
@@ -365,7 +472,6 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         let mut num_free = alloc_table.num_free.lock().unwrap();
         let mut bitmap = alloc_table.bitmap.lock();
         let mut num_dealloc = 0_usize;
-
         for (block_id, block_diff) in diff_table.iter() {
             match block_diff {
                 AllocDiff::Alloc => {
@@ -395,5 +501,67 @@ impl From<u8> for AllocDiff {
             7 => AllocDiff::Dealloc,
             _ => AllocDiff::Invalid,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::layers::disk::{block_alloc::AllocTable, segment::SEGMENT_SIZE};
+    use core::num::NonZeroUsize;
+
+    #[test]
+    fn test_alloc_table() {
+        let alloc_table = AllocTable::new(NonZeroUsize::new(1024).unwrap());
+        assert_eq!(alloc_table.alloc(), Some(0));
+        assert_eq!(alloc_table.alloc(), Some(1));
+        assert_eq!(alloc_table.segment_table[0].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.segment_table[0].free_space(), 1022);
+
+        alloc_table.set_deallocated(0);
+        assert_eq!(alloc_table.segment_table[0].num_valid_blocks(), 1023);
+        assert_eq!(alloc_table.segment_table[0].free_space(), 1023);
+        alloc_table.set_deallocated(1);
+        assert_eq!(alloc_table.segment_table[0].num_valid_blocks(), 1022);
+        assert_eq!(alloc_table.segment_table[0].free_space(), 1024);
+    }
+
+    #[test]
+    fn test_alloc_table_batch() {
+        let alloc_table = AllocTable::new(NonZeroUsize::new(1024).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(1024).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 1024);
+        assert!(alloc_table.segment_table[0].num_valid_blocks() == 1024);
+        assert_eq!(alloc_table.segment_table[0].free_space(), 0);
+
+        let alloc_table = AllocTable::new(NonZeroUsize::new(4 * SEGMENT_SIZE).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(SEGMENT_SIZE + 2).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 1026);
+        assert_eq!(alloc_table.segment_table[0].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.segment_table[1].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.segment_table[0].free_space(), 0);
+        assert_eq!(alloc_table.segment_table[1].free_space(), 1022);
+
+        alloc_table.set_deallocated(1024);
+        assert_eq!(alloc_table.segment_table[1].num_valid_blocks(), 1023);
+        assert_eq!(alloc_table.segment_table[1].free_space(), 1023);
+
+        let alloc_table = AllocTable::new(NonZeroUsize::new(200 * SEGMENT_SIZE).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(100 * SEGMENT_SIZE + 2).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 100 * SEGMENT_SIZE + 2);
+        for segment_id in 0..100 {
+            assert_eq!(
+                alloc_table.segment_table[segment_id].num_valid_blocks(),
+                SEGMENT_SIZE
+            );
+            assert_eq!(alloc_table.segment_table[segment_id].free_space(), 0);
+        }
+        assert_eq!(alloc_table.segment_table[100].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.segment_table[100].free_space(), 1022);
     }
 }
