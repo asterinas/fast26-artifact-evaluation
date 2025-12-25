@@ -23,12 +23,11 @@ use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
     TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{
-    Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
-};
+use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
+use crate::os::{spawn, Arc};
 use crate::{CostL3Type, COST_L2, COST_L3};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
@@ -37,8 +36,6 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use pod::Pod;
 use spin::Mutex;
-use std::thread;
-use time::Time;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -64,8 +61,11 @@ impl ConfigCell {
         if !self.initialized.swap(true, Ordering::SeqCst) {
             unsafe {
                 *self.value.get() = config;
+                println!(
+                    "CONFIG set successfully: cache_size={}",
+                    (*self.value.get()).cache_size
+                );
             }
-            println!("CONFIG set successfully: cache_size={}", config.cache_size);
         } else {
             println!("CONFIG already initialized, ignoring new config");
         }
@@ -172,12 +172,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         config: Option<Config>,
-        enable_gc: bool,
-        victim_policy_ref: Option<VictimPolicyRef>,
     ) -> Result<Self> {
-        if let Some(cfg) = config {
-            CONFIG.set(cfg);
-        }
+        let cfg = config.unwrap_or_default();
+        CONFIG.set(cfg.clone());
+        let enable_gc = cfg.enable_gc;
 
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -224,7 +222,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let dealloc_table = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
-                if dealloc_table.has_deallocated(record.value().hba) {
+                // Only check dealloc_table when GC is enabled to avoid unnecessary mutex operations
+                if CONFIG.get().enable_gc && dealloc_table.has_deallocated(record.value().hba) {
                     dealloc_table.finish_deallocated(record.value().hba);
                     return;
                 }
@@ -254,16 +253,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             shared_state,
             is_active: Arc::new(AtomicBool::new(true)),
         });
+
         if enable_gc {
-            let gc_worker = match victim_policy_ref {
-                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
-                None => {
-                    // use GreedyVictimPolicy by default
-                    let policy = Arc::new(GreedyVictimPolicy {});
-                    inner.create_gc_worker(policy)?
-                }
-            };
-            thread::spawn(move || gc_worker.run());
+            let policy = cfg.get_victim_policy();
+            let gc_worker = inner.create_gc_worker(policy)?;
+            spawn(move || gc_worker.run());
         }
 
         let new_self = Self { inner };
@@ -278,14 +272,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     pub fn open(
         disk: D,
         root_key: Key,
-        victim_policy_ref: Option<VictimPolicyRef>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         config: Option<Config>,
-        enable_gc: bool,
     ) -> Result<Self> {
-        if let Some(cfg) = config {
-            CONFIG.set(cfg);
-        }
+        let cfg = config.unwrap_or_default();
+        CONFIG.set(cfg.clone());
+        let enable_gc = cfg.enable_gc;
 
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -329,8 +321,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let table = block_validity_table.clone();
             let rit = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
-                //  Deallocate the host block while the corresponding record is dropped in `MemTable`
-                if rit.has_deallocated(record.value().hba) {
+                // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                // Only check dealloc_table when GC is enabled to avoid unnecessary mutex operations
+                if CONFIG.get().enable_gc && rit.has_deallocated(record.value().hba) {
                     rit.finish_deallocated(record.value().hba);
                     return;
                 }
@@ -362,15 +355,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         });
 
         if enable_gc {
-            let gc_worker = match victim_policy_ref {
-                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
-                None => {
-                    // use GreedyVictimPolicy by default
-                    let policy = Arc::new(GreedyVictimPolicy {});
-                    inner.create_gc_worker(policy)?
-                }
-            };
-            thread::spawn(move || gc_worker.run());
+            let policy = cfg.get_victim_policy();
+            let gc_worker = inner.create_gc_worker(policy)?;
+            spawn(move || gc_worker.run());
         }
 
         let opened_self = Self { inner };
@@ -725,7 +712,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
-        // self.logical_block_table.sync()?;
+        if !CONFIG.get().enable_gc {
+            self.logical_block_table.sync()?;
+        }
 
         let timer = if CONFIG.get().stat_cost {
             Some(COST_L3.time(CostL3Type::Allocation))
@@ -830,7 +819,12 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     // In the stop the world manner. to maximize the concurrency, we should call this function after accessing data_buf and before accessing these data structures.
     // To simplify the implementation, we should only call this function in some fn related to accessing these data structures directly.
     // E.g. fn flush_data_buf(), read_one_block(), read_multi_blocks()
+    #[inline]
     fn wait_for_background_gc(&self) {
+        // Fast path: skip waiting if GC is disabled
+        if !CONFIG.get().enable_gc {
+            return;
+        }
         self.shared_state.wait_for_background_gc();
     }
 }
@@ -994,7 +988,9 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
                 unreachable!();
             }
             TxType::Compaction { .. } | TxType::Migration => {
-                if self.dealloc_table.has_deallocated(record.value().hba) {
+                // Only check dealloc_table when GC is enabled to avoid unnecessary mutex operations
+                if CONFIG.get().enable_gc && self.dealloc_table.has_deallocated(record.value().hba)
+                {
                     self.dealloc_table.finish_deallocated(record.value().hba);
                     return Ok(());
                 }
@@ -1143,7 +1139,7 @@ mod impl_block_device {
                 crate::Errno::OutOfDisk => Self::NoDeviceSpace,
                 crate::Errno::PermissionDenied => Self::PermError,
                 _ => {
-                    log::error!("[SwornDisk] Error occurred: {value:?}");
+                    println!("[SwornDisk] Error occurred: {value:?}");
                     Self::DeviceError(0)
                 }
             }
@@ -1166,7 +1162,7 @@ mod tests {
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, None, false, None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, None)?;
         let num_rw = 1024;
 
         // // Submit a write block I/O request
@@ -1203,7 +1199,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None, false, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);

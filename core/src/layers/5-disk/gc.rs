@@ -33,7 +33,6 @@ use core::{
 use hashbrown::{HashMap, HashSet};
 use log::debug;
 use pod::Pod;
-use std::time::Instant;
 // Default gc interval time is 30 seconds
 const ACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(5);
 const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_millis(100);
@@ -310,10 +309,14 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             INACTIVE_GC_THRESHOLD
         };
 
+        // GC is only enabled when segment_table exists
+        let segment_table = self
+            .block_validity_table
+            .get_segment_table_ref()
+            .expect("segment_table must exist when GC is enabled");
+
         for _ in 0..GC_WATERMARK {
-            let victim = self
-                .victim_policy
-                .pick_victim(self.block_validity_table.get_segment_table_ref(), threshold);
+            let victim = self.victim_policy.pick_victim(segment_table, threshold);
 
             // Generally, the VictimPolicy will pick a victim segment that most needs GC
             // if it returned None, it means there is no segment needs GC, we can return
@@ -399,7 +402,12 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         &self,
         victim: Victim,
     ) -> Result<(Vec<Hba>, Vec<(Lba, Hba)>, Vec<Hba>)> {
-        let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
+        // GC is only enabled when segment_table exists
+        let segment_table = self
+            .block_validity_table
+            .get_segment_table_ref()
+            .expect("segment_table must exist when GC is enabled");
+        let victim_segment = &segment_table[victim.segment_id];
 
         let (valid_hbas, discard_hbas) = victim.blocks.into_iter().try_fold(
             (Vec::new(), Vec::new()),
@@ -422,7 +430,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
         let mut target_hbas = Vec::new();
         let mut found_enough_blocks = false;
-        for segment in self.block_validity_table.get_segment_table_ref() {
+        for segment in segment_table.iter() {
             if segment.free_space() == 0 || segment.segment_id() == victim_segment.segment_id() {
                 continue;
             }
@@ -443,7 +451,12 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     }
 
     pub fn clean_and_migrate_data(&self, victim: Victim) -> Result<Vec<(Hba, Hba)>> {
-        let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
+        // GC is only enabled when segment_table exists
+        let segment_table = self
+            .block_validity_table
+            .get_segment_table_ref()
+            .expect("segment_table must exist when GC is enabled");
+        let victim_segment = &segment_table[victim.segment_id];
 
         //        let start = Instant::now();
         let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
@@ -517,6 +530,7 @@ mod tests {
             bio::MemDisk,
             disk::{
                 block_alloc::{AllocTable, BlockAlloc},
+                config::Config,
                 gc::{GreedyVictimPolicy, VictimPolicy},
                 segment::{Segment, SEGMENT_SIZE},
             },
@@ -717,7 +731,11 @@ mod tests {
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
 
-        let disk = SwornDisk::create(mem_disk, root_key, None, true, None).unwrap();
+        let config = Some(Config {
+            enable_gc: true,
+            ..Default::default()
+        });
+        let disk = SwornDisk::create(mem_disk, root_key, None, config).unwrap();
         let gc_worker = disk
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
@@ -750,7 +768,11 @@ mod tests {
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
 
-        let disk = SwornDisk::create(mem_disk, root_key, None, true, None).unwrap();
+        let config = Some(Config {
+            enable_gc: true,
+            ..Default::default()
+        });
+        let disk = SwornDisk::create(mem_disk, root_key, None, config).unwrap();
         let gc_worker = disk
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
@@ -799,7 +821,11 @@ mod tests {
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
 
-        let disk = SwornDisk::create(mem_disk, root_key, None, true, None).unwrap();
+        let config = Some(Config {
+            enable_gc: true,
+            ..Default::default()
+        });
+        let disk = SwornDisk::create(mem_disk, root_key, None, config).unwrap();
         let gc_worker = disk
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();

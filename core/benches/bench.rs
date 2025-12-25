@@ -327,6 +327,11 @@ mod benches {
         fn create_disk(total_nblocks: usize, disk_type: DiskType) -> Result<Arc<dyn BenchDisk>> {
             static DISK_ID: AtomicU32 = AtomicU32::new(0);
 
+            let config = Some(Config {
+                enable_gc: true,
+                ..Default::default()
+            });
+
             let disk: Arc<dyn BenchDisk> = match disk_type {
                 DiskType::SwornDisk => Arc::new(SwornDisk::create(
                     FileAsDisk::create(
@@ -338,8 +343,7 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
-                    true,
-                    None,
+                    config,
                 )?),
 
                 DiskType::EncDisk => Arc::new(EncDisk::create(
@@ -534,7 +538,12 @@ mod consts {
 #[allow(dead_code, temporary_cstring_as_ptr)]
 mod disks {
     use super::*;
-    use std::{ffi::CString, ops::Range, sync::atomic::AtomicUsize, time::Duration};
+    use std::{
+        ffi::CString,
+        ops::Range,
+        sync::atomic::{AtomicBool, AtomicUsize},
+        time::Duration,
+    };
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum DiskType {
@@ -683,17 +692,33 @@ mod disks {
             let buf = Buf::alloc(buf_nblocks)?;
 
             let current_bytes = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
             let interval = Duration::from_secs(1);
 
             // Clone the Arc to share it with the spawned thread
             let current_bytes_clone = Arc::clone(&current_bytes);
-            std::thread::spawn(move || loop {
-                std::thread::sleep(interval);
-                let bytes = current_bytes_clone.load(Ordering::Acquire);
+            let stop_clone = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut last_bytes = 0usize;
+                loop {
+                    std::thread::sleep(interval);
+                    let bytes = current_bytes_clone.load(Ordering::Acquire);
 
-                if bytes > 0 {
-                    let throughput = DisplayThroughput::new(bytes, interval);
-                    println!("throughput: {}", throughput);
+                    let delta = bytes.saturating_sub(last_bytes);
+                    last_bytes = bytes;
+
+                    if delta > 0 {
+                        let throughput = DisplayThroughput::new(delta, interval);
+                        println!(
+                            "throughput: {}, total_written: {}",
+                            throughput,
+                            DisplayData::new(bytes)
+                        );
+                    }
+
+                    if stop_clone.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             });
 
@@ -701,7 +726,7 @@ mod disks {
                 self.write(pos + i * buf_nblocks, buf.as_ref())?;
                 current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
-            current_bytes.store(0, Ordering::Release);
+            stop.store(true, Ordering::Release);
             self.sync()?;
             Ok(())
         }
@@ -727,21 +752,33 @@ mod disks {
             let buf = Buf::alloc(buf_nblocks)?;
 
             let current_bytes = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
             let interval = Duration::from_secs(1);
 
             // Clone the Arc to share it with the spawned thread
             let current_bytes_clone = Arc::clone(&current_bytes);
-            std::thread::spawn(move || loop {
-                std::thread::sleep(interval);
-                let bytes = current_bytes_clone.load(Ordering::Acquire);
+            let stop_clone = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut last_bytes = 0usize;
+                loop {
+                    std::thread::sleep(interval);
+                    let bytes = current_bytes_clone.load(Ordering::Acquire);
 
-                if bytes > 0 {
-                    let throughput = DisplayThroughput::new(bytes, interval);
-                    println!("throughput: {}", throughput);
-                }
+                    let delta = bytes.saturating_sub(last_bytes);
+                    last_bytes = bytes;
 
-                if bytes == 11455555 {
-                    return;
+                    if delta > 0 {
+                        let throughput = DisplayThroughput::new(delta, interval);
+                        println!(
+                            "throughput: {}, total_written: {}",
+                            throughput,
+                            DisplayData::new(bytes)
+                        );
+                    }
+
+                    if stop_clone.load(Ordering::Acquire) {
+                        return;
+                    }
                 }
             });
 
@@ -750,7 +787,7 @@ mod disks {
                 self.write(pos + rnd_pos, buf.as_ref())?;
                 current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
-            current_bytes.store(11455555, Ordering::Release);
+            stop.store(true, Ordering::Release);
             self.sync()?;
             Ok(())
         }

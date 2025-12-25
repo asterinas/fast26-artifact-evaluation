@@ -5,16 +5,16 @@ use crate::prelude::{Error, Result};
 
 use core::marker::PhantomData;
 use core::ptr::NonNull;
+pub use hashbrown::{HashMap, HashSet};
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 use sgx_rand::{thread_rng, Rng as _};
 use sgx_tcrypto::{rsgx_aes_ctr_decrypt, rsgx_aes_ctr_encrypt};
 use sgx_tcrypto::{rsgx_rijndael128GCM_decrypt, rsgx_rijndael128GCM_encrypt};
 use sgx_tstd::alloc::{alloc, dealloc, Layout};
+
 use sgx_tstd::thread;
 use sgx_types::{sgx_key_128bit_t, sgx_status_t};
-
-pub use hashbrown::{HashMap, HashSet};
 /// Reuse lock implementation of crate spin.
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -22,6 +22,7 @@ pub use sgx_tstd::boxed::Box;
 pub use sgx_tstd::collections::BTreeMap;
 pub use sgx_tstd::string::{String, ToString};
 pub use sgx_tstd::sync::{Arc, Weak};
+pub use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};
 pub use sgx_tstd::thread::{sleep, spawn, JoinHandle};
 pub use sgx_tstd::vec::Vec;
 
