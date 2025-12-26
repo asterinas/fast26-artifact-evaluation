@@ -612,6 +612,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 self.logical_block_table.manual_compaction()?;
                 // try write again
                 ret = self.write_blocks_from_data_buf();
+
+                if let Err(e) = ret.as_ref() {
+                    if e.errno() == OutOfDisk {
+                        self.logical_block_table.force_compaction()?;
+                        // try write again
+                        ret = self.write_blocks_from_data_buf();
+                    }
+                }
             }
         }
 
@@ -712,7 +720,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
-        if !CONFIG.get().enable_gc {
+        if CONFIG.get().sync_atomicity {
             self.logical_block_table.sync()?;
         }
 

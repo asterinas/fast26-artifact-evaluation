@@ -240,6 +240,18 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         self.do_compaction_tx(wal_id)
     }
 
+    pub fn force_commit(&self) -> Result<()> {
+        let inner = &self.0;
+        let wal_id = inner.wal_append_tx.commit()?;
+
+        inner.compactor.wait_compaction()?;
+
+        inner.memtable_manager.switch().unwrap();
+
+        self.do_compaction_tx(wal_id)?;
+        Ok(())
+    }
+
     /// Persist all in-memory data of `TxLsmTree` to the backed storage.
     pub fn sync(&self) -> Result<()> {
         self.0.sync()
@@ -265,6 +277,31 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         {
             inner.do_major_compaction(LsmLevel::L2)?;
         }
+        inner.shared_state.notify_compaction_finished();
+        Ok(())
+    }
+
+    pub fn force_compaction(&self) -> Result<()> {
+        let inner = self.0.clone();
+        inner.shared_state.wait_for_background_gc();
+        inner.shared_state.start_compaction();
+        self.force_commit()?;
+        if inner
+            .sst_manager
+            .read()
+            .require_major_compaction_force(LsmLevel::L0)
+        {
+            inner.do_major_compaction(LsmLevel::L1)?;
+        }
+
+        if inner
+            .sst_manager
+            .read()
+            .require_major_compaction_force(LsmLevel::L1)
+        {
+            inner.do_major_compaction(LsmLevel::L2)?;
+        }
+
         inner.shared_state.notify_compaction_finished();
         Ok(())
     }
@@ -997,6 +1034,11 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
         }
         self.level_ssts[from_level as usize].len()
             >= LsmLevel::LEVELI_RATIO.pow(from_level as _) as _
+    }
+
+    pub fn require_major_compaction_force(&self, from_level: LsmLevel) -> bool {
+        debug_assert!(from_level != LsmLevel::L5);
+        self.level_ssts[from_level as usize].len() >= 1
     }
 }
 

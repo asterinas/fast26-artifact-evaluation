@@ -11,6 +11,7 @@ pub struct Config {
     pub stat_cost: bool,
     pub enable_gc: bool,
     pub victim_policy: Option<VictimPolicyRef>,
+    pub sync_atomicity: bool,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             stat_cost: false,
             enable_gc: false,
             victim_policy: None,
+            sync_atomicity: true,
         }
     }
 }
