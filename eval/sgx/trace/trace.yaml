@@ -1,0 +1,13 @@
+includes:
+  - base.yaml
+targets:
+  # copy bins
+  - target: /bin
+    copy:
+      - files:
+        - ../trace
+  # copy config files
+  - target: /
+    copy:
+      - dirs:
+        - ../msr-test

@@ -1,0 +1,43 @@
+# reproduce.fio
+# Benchmark config for comparing SwornDisk and CryptDisk
+# Direct block device testing (no filesystem)
+
+[global]
+ioengine=sync
+size=40G
+thread=1
+numjobs=1
+direct=1
+fsync_on_close=1
+time_based=1
+runtime=20
+
+# Sequential Write Tests
+[seq-write-256k]
+stonewall
+wait_for_previous
+group_reporting
+rw=write
+bs=256k
+
+# Random Write Tests
+[rand-write-4k]
+stonewall
+wait_for_previous
+group_reporting
+rw=randwrite
+bs=4k
+
+[rand-write-32k]
+stonewall
+wait_for_previous
+group_reporting
+rw=randwrite
+bs=32k
+
+[rand-write-256k]
+stonewall
+wait_for_previous
+group_reporting
+rw=randwrite
+bs=256k

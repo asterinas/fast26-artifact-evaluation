@@ -1,0 +1,17 @@
+; rand-read-layout.fio - prepare data for random read test
+
+[global]
+name=cost-rand-read-layout
+filename=/dev/sworndisk
+rw=write
+bs=256K
+direct=0
+numjobs=1
+fsync_on_close=1
+end_fsync=1
+
+[file1]
+size=40G
+ioengine=sync
+iodepth=16
+

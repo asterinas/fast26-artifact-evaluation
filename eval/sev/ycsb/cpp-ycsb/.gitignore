@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database directories
+/tmp/rocksdb-ycsb/
+*.db/
+
+# OS files
+.DS_Store
+Thumbs.db

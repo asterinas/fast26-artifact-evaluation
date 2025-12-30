@@ -1,0 +1,17 @@
+; seq-write-fill.fio
+; Sequential write to fill disk to target utilization
+; Use --filename to specify target device (/dev/sworndisk or /dev/cryptdisk)
+; Use --size to control how much data to write
+
+[global]
+ioengine=sync
+thread=1
+numjobs=1
+direct=1
+fsync_on_close=1
+
+[seq-write-fill]
+rw=randwrite
+bs=4k
+time_based=0
+end_fsync=1

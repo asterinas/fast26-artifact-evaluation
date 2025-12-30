@@ -1,0 +1,17 @@
+; seq-write.fio for cost statistics
+
+[global]
+name=cost-seq-write
+filename=/dev/sworndisk
+rw=write
+bs=256K
+direct=1
+numjobs=1
+time_based
+runtime=30
+
+[file1]
+size=40G
+ioengine=sync
+iodepth=16
+

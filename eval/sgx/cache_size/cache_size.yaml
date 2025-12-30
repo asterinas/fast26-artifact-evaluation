@@ -1,0 +1,13 @@
+includes:
+  - base.yaml
+targets:
+  # copy fio binary
+  - target: /bin
+    copy:
+      - files:
+        - ../../fio/fio_src/fio
+  # copy config files
+  - target: /
+    copy:
+      - dirs:
+        - ../configs

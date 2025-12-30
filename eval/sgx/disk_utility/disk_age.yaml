@@ -1,0 +1,15 @@
+includes:
+  - base.yaml
+# disk_age experiment
+targets:
+  # copy fio binary
+  - target: /bin
+    copy:
+      - files:
+        - ../../fio/fio_src/fio
+  # copy config files
+  - target: /configs
+    copy:
+      - files:
+        - ../configs/rand-write-4k.fio
+

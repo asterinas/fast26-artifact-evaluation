@@ -1,0 +1,16 @@
+; 4K Random Read Test for two_level_caching optimization
+[global]
+name=optimization-rand-read-4k
+filename=/ext2/sworndisk
+rw=randread
+bs=4K
+direct=1
+numjobs=1
+time_based
+runtime=20
+fsync_on_close=1
+
+[file1]
+size=20G
+ioengine=sync
+iodepth=16

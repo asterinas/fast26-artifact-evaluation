@@ -1,0 +1,18 @@
+# Workload A: Update heavy workload
+# 50% read, 50% update
+
+recordcount=100000
+operationcount=100000
+workload=core
+
+fieldcount=10
+fieldlength=100
+
+readallfields=true
+
+readproportion=0.5
+updateproportion=0.5
+scanproportion=0
+insertproportion=0
+
+requestdistribution=uniform

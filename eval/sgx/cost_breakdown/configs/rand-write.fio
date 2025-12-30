@@ -1,0 +1,17 @@
+; rand-write.fio for cost statistics
+
+[global]
+name=cost-rand-write
+filename=/dev/sworndisk
+rw=randwrite
+bs=4K
+direct=1
+numjobs=1
+time_based
+runtime=30
+
+[file1]
+size=40G
+ioengine=sync
+iodepth=16
+

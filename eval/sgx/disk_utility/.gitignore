@@ -1,0 +1,14 @@
+# Occlum instance
+occlum_instance*/
+
+# Results
+results/
+
+# Generated plots
+*.png
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+

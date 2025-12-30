@@ -1,5 +1,14 @@
-# MlsDisk
+# MlsDisk FAST'26 Artifact Evaluation
 
+This repository provides the artifacts and instructions to conduct artifact evaluation for the following paper.
+
+> Erci Xu, Hongliang Tian, Xinyi Yu, Lujia Yin, Xinyuan Luo, Shaowei Song, Qingsong Chen, Shoumeng Yan, Jiwu Shu, Yiming Zhang. StrataDisk: Trusted Block Storage for TEEs Based on Layered Secure Logging. USNIX FAST'26.
+
+Follow this [evaluation document](./eval/README.md) to reproduce the main results reported by the paper.
+
+The most up-to-date version of MlsDisk can be found [here](https://github.com/asterinas/mlsdisk)
+
+---
 ## Introduction
 
 MlsDisk is a **multilayered log-structured secure virtual disk for TEEs**,

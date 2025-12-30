@@ -1,0 +1,19 @@
+# Workload E: Scan workload
+# 95% scan, 5% insert
+
+recordcount=100000
+operationcount=100000
+workload=core
+
+fieldcount=10
+fieldlength=100
+
+readallfields=true
+
+readproportion=0
+updateproportion=0
+scanproportion=0.95
+insertproportion=0.05
+
+requestdistribution=uniform
+maxscanlength=100

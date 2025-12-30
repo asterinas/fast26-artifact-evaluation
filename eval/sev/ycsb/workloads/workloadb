@@ -1,0 +1,18 @@
+# Workload B: Read mostly workload
+# 95% read, 5% update
+
+recordcount=100000
+operationcount=100000
+workload=core
+
+fieldcount=10
+fieldlength=100
+
+readallfields=true
+
+readproportion=0.95
+updateproportion=0.05
+scanproportion=0
+insertproportion=0
+
+requestdistribution=uniform

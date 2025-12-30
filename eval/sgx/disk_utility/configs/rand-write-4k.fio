@@ -1,0 +1,15 @@
+; rand-write-4k.fio
+; Random write test on block device
+; Use --filename to specify target device (/dev/sworndisk or /dev/cryptdisk)
+; Use --size to specify the range for random writes (should match disk fill level)
+
+[global]
+ioengine=sync
+thread=1
+numjobs=1
+direct=1
+fsync_on_close=1
+
+[rand-write-4k]
+rw=randwrite
+bs=4k

@@ -1,0 +1,17 @@
+; seq-read.fio for cost statistics
+
+[global]
+name=cost-seq-read
+filename=/dev/sworndisk
+rw=read
+bs=256K
+direct=1
+numjobs=1
+time_based
+runtime=10
+size=40G
+
+
+[file1]
+ioengine=sync
+

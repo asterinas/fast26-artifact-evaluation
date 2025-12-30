@@ -1,0 +1,10 @@
+fio_src/
+occlum_instance/
+output.txt
+result.json
+MSR*
+msr-test/
+trace
+msr-cambridge1.tar
+msr-cambridge2.tar
+benchmark_results/

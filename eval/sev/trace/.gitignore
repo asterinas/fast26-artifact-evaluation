@@ -1,0 +1,21 @@
+# Compiled program
+trace
+
+# Benchmark results
+benchmark_results/*.txt
+benchmark_results/*.json
+
+# Generated charts
+*.png
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+msr-test 

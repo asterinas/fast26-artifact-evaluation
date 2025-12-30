@@ -1,0 +1,15 @@
+; seq-read-layout.fio - prepare data for sequential read test
+
+[global]
+name=cost-seq-read-layout
+filename=/dev/sworndisk
+rw=write
+bs=256K
+direct=1
+numjobs=1
+size=40G
+fsync_on_close=1
+end_fsync=1
+
+[file1]
+ioengine=sync

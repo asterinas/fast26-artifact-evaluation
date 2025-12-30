@@ -1,0 +1,17 @@
+; rand-read.fio for cost statistics
+
+[global]
+name=cost-rand-read
+filename=/dev/sworndisk
+rw=randread
+bs=4K
+direct=0
+numjobs=1
+time_based
+runtime=30
+
+[file1]
+size=40G
+ioengine=sync
+iodepth=16
+

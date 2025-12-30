@@ -1,0 +1,7 @@
+occlum_instance/
+results/
+*.log
+cleaning
+output.txt
+result.json
+benchmark_results/
