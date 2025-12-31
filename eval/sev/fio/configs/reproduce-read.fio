@@ -4,13 +4,11 @@
 
 [global]
 ioengine=sync
-size=40G
+size=50G
 thread=1
 numjobs=1
 direct=1
 fsync_on_close=1
-time_based=1
-runtime=20
 
 # Layout: create file for read tests (not time-based, write entire file)
 [layout]
@@ -18,7 +16,7 @@ stonewall
 wait_for_previous
 rw=write
 bs=256k
-time_based=0
+offset=0
 end_fsync=1
 
 # Sequential Read Test
@@ -27,6 +25,9 @@ stonewall
 wait_for_previous
 group_reporting
 rw=read
+offset=0
+time_based=1
+runtime=20
 bs=256k
 
 # Random Read Tests
@@ -35,6 +36,9 @@ stonewall
 wait_for_previous
 group_reporting
 rw=randread
+offset=0
+time_based=1
+runtime=20
 bs=4k
 
 [rand-read-32k]
@@ -42,6 +46,9 @@ stonewall
 wait_for_previous
 group_reporting
 rw=randread
+offset=0
+time_based=1
+runtime=20
 bs=32k
 
 [rand-read-256k]
@@ -49,4 +56,7 @@ stonewall
 wait_for_previous
 group_reporting
 rw=randread
+offset=0
+time_based=1
+runtime=20
 bs=256k
