@@ -13,14 +13,18 @@ OUTPUT_DIR="${SCRIPT_DIR}/results"
 # Workloads to test
 WORKLOADS=("fileserver" "oltp" "varmail" "videoserver")
 
-# Disk types to test
-DISK_TYPES=("PfsDisk" "sworndisk" "cryptdisk")
+# Disk types to test (all use ext2 mount now)
+DISK_TYPES=("pfsdisk" "sworndisk" "cryptdisk")
 
-# Test directory paths for each disk type
-declare -A TEST_DIRS
-TEST_DIRS["PfsDisk"]="/root/fbtest"
-TEST_DIRS["sworndisk"]="/ext2/fbtest"
-TEST_DIRS["cryptdisk"]="/ext2/fbtest"
+# Test directory path (all use ext2)
+TEST_DIR="/ext2/fbtest"
+
+# Disk size per workload
+declare -A DISK_SIZES
+DISK_SIZES["fileserver"]="10GB"
+DISK_SIZES["oltp"]="10GB"
+DISK_SIZES["varmail"]="10GB"
+DISK_SIZES["videoserver"]="40GB"
 
 function usage() {
     echo "Usage: $0 [workload]"
@@ -38,7 +42,6 @@ function check_filebench() {
 function generate_workload_file() {
     local workload=$1
     local disk_type=$2
-    local test_dir=${TEST_DIRS[$disk_type]}
     local template_file="${SCRIPT_DIR}/workloads/${workload}-template.f"
     local output_file="${SCRIPT_DIR}/workloads/${workload}-${disk_type}.f"
 
@@ -48,39 +51,29 @@ function generate_workload_file() {
     fi
 
     # Replace placeholder with actual directory
-    # Use single quotes to prevent bash from expanding $BENCHMARK_DIR as a variable
-    sed 's|\$BENCHMARK_DIR\$|'"${test_dir}"'|g' "${template_file}" > "${output_file}"
+    sed 's|\$BENCHMARK_DIR\$|'"${TEST_DIR}"'|g' "${template_file}" > "${output_file}"
 
     echo "${workload}-${disk_type}.f"
 }
 
 function init_occlum_instance() {
     local disk_type=$1
-    echo -e "${YELLOW}Initializing Occlum instance for ${disk_type}...${NC}" >&2
+    local disk_size=$2
+    echo -e "${YELLOW}Initializing Occlum instance for ${disk_type} (disk_size=${disk_size})...${NC}" >&2
 
     rm -rf occlum_instance && occlum new occlum_instance
     cd occlum_instance
 
     TCS_NUM=$(($(nproc) * 2))
 
-    if [ "$disk_type" == "PfsDisk" ]; then
-        # PfsDisk: no ext2 mount needed
-        new_json="$(jq --argjson THREAD_NUM ${TCS_NUM} '
-            .resource_limits.user_space_size="10000MB" |
-            .resource_limits.user_space_max_size = "10000MB" |
-            .resource_limits.kernel_space_heap_size = "5000MB" |
-            .resource_limits.kernel_space_heap_max_size="5000MB" |
-            .resource_limits.max_num_of_threads = $THREAD_NUM' Occlum.json)"
-    else
-        # SwornDisk or CryptDisk: mount ext2
-        new_json="$(jq --argjson THREAD_NUM ${TCS_NUM} --arg DISK_NAME "$disk_type" '
-            .resource_limits.user_space_size="10000MB" |
-            .resource_limits.user_space_max_size = "10000MB" |
-            .resource_limits.kernel_space_heap_size = "5000MB" |
-            .resource_limits.kernel_space_heap_max_size="5000MB" |
-            .resource_limits.max_num_of_threads = $THREAD_NUM |
-            .mount += [{"target": "/ext2", "type": "ext2", "options": {"disk_size": "50GB", "disk_name": $DISK_NAME}}]' Occlum.json)"
-    fi
+    # All disk types use ext2 mount
+    new_json="$(jq --argjson THREAD_NUM ${TCS_NUM} --arg DISK_NAME "$disk_type" --arg DISK_SIZE "$disk_size" '
+        .resource_limits.user_space_size="10000MB" |
+        .resource_limits.user_space_max_size = "10000MB" |
+        .resource_limits.kernel_space_heap_size = "5000MB" |
+        .resource_limits.kernel_space_heap_max_size="5000MB" |
+        .resource_limits.max_num_of_threads = $THREAD_NUM |
+        .mount += [{"target": "/ext2", "type": "ext2", "options": {"disk_size": $DISK_SIZE, "disk_name": $DISK_NAME}}]' Occlum.json)"
     echo "${new_json}" > Occlum.json
 
     rm -rf image
@@ -98,15 +91,24 @@ function run_filebench_test() {
     echo -e "${GREEN}Running filebench [${workload}] on ${disk_type}...${NC}" >&2
 
     cd occlum_instance
+    # Disable exit on error for this command to ensure we continue with other workloads
+    set +e
     occlum run /bin/filebench -f "/workloads/${workload_file}" 2>&1 | tee "${output_file}" >&2
+    local exit_code=$?
+    set -e
+
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${YELLOW}Warning: filebench exited with code ${exit_code}${NC}" >&2
+    fi
     cd ..
 }
 
 function run_single_workload() {
     local workload=$1
+    local disk_size=${DISK_SIZES[$workload]}
 
     for disk_type in "${DISK_TYPES[@]}"; do
-        echo -e "\n${YELLOW}========== Testing ${workload} on ${disk_type} ==========${NC}\n" >&2
+        echo -e "\n${YELLOW}========== Testing ${workload} on ${disk_type} (${disk_size}) ==========${NC}\n" >&2
 
         # Generate workload file with correct path
         local workload_file=$(generate_workload_file "$workload" "$disk_type" 2>/dev/null)
@@ -114,7 +116,7 @@ function run_single_workload() {
             continue
         fi
 
-        init_occlum_instance "$disk_type" >&2
+        init_occlum_instance "$disk_type" "$disk_size" >&2
         run_filebench_test "$disk_type" "$workload" "$workload_file"
     done
 }

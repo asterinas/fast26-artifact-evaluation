@@ -39,7 +39,7 @@ declare -A TEST_TYPES=(
 )
 
 # Disk types to test
-DISK_TYPES=("cryptdisk")
+DISK_TYPES=("PfsDisk" "sworndisk" "cryptdisk")
 
 # Write paths for each disk type (directly use block device)
 declare -A WRITE_PATHS

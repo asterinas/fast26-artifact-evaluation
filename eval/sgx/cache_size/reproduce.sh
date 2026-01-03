@@ -12,10 +12,10 @@ OUTPUT_DIR="${SCRIPT_DIR}/results"
 RESULT_JSON="${OUTPUT_DIR}/cache_size_result.json"
 
 # Cache sizes (MB) to test
-CACHE_SIZES_MB=(1280 1536)
+CACHE_SIZES_MB=(256 512 768 1024 1280 1536)
 
 # Disk types to test
-DISK_TYPES=("sworndisk" "cryptdisk")
+DISK_TYPES=("pfsdisk" "sworndisk" "cryptdisk")
 
 # Current disk type (set by outer loop)
 DISK_TYPE=""

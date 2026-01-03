@@ -1,94 +1,95 @@
-import json
+import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
+import os
 
-# 1. Configuration: File paths
-input_path = Path("/root/occlum/eval/cache_size/results/cache_size_result.json")
-output_path = Path("result.png")
+# 1. Load data
+file_path = './results/reproduce_results.csv'
 
-def load_data(path):
-    with open(path, "r") as f:
-        data = json.load(f)
+if not os.path.exists(file_path):
+    print(f"Error: {file_path} not found.")
+    exit(1)
 
-    # Disk type mapping
-    disk_map = {"cryptdisk": "CryptDisk", "pfsdisk": "PfsDisk", "sworndisk": "StrataDisk"}
-    
-    # Structure: results[op][disk_name] = {cache_gb: throughput}
-    results = {"write": {}, "read": {}}
-    
-    for entry in data:
-        op = entry["op"]
-        dt = disk_map.get(entry.get("disk_type", "sworndisk"), entry.get("disk_type", "sworndisk"))
-        gb = entry["cache_size_mb"] / 1024.0
-        val = entry["throughput_mib_s"]
-        
-        if dt not in results[op]:
-            results[op][dt] = {}
-        results[op][dt][gb] = val
-        
-    return results
+df = pd.read_csv(file_path)
 
-def plot_cache_benchmark(results, save_path):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+# Separate data by disk type
+sworn_data = df[df['disk_type'] == 'sworndisk'].copy()
+crypt_data = df[df['disk_type'] == 'cryptdisk'].copy()
 
-    # Styling constants (Matching image)
-    configs = {
-        "CryptDisk": {"color": "#e74c3c", "marker": "o"}, # Red Circle
-        "PfsDisk":   {"color": "#8eb060", "marker": "s"}, # Green Square
-        "StrataDisk": {"color": "#3b75af", "marker": "^"} # Blue Triangle
-    }
-    
-    x_ticks = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
-    disk_order = ["CryptDisk", "PfsDisk", "StrataDisk"]
+# Ensure numeric types
+# We use logical_gb for X-axis to align with 10-90% ticks perfectly
+sworn_data['logical_gb'] = pd.to_numeric(sworn_data['logical_gb']) 
+crypt_data['logical_gb'] = pd.to_numeric(crypt_data['logical_gb'])
 
-    # --- Plotting Function for subplots ---
-    def draw_subplot(ax, op_type, title, y_limit):
-        op_data = results[op_type]
-        for dt in disk_order:
-            if dt in op_data:
-                # Sort data points by cache size
-                sorted_x = sorted(op_data[dt].keys())
-                sorted_y = [op_data[dt][x] for x in sorted_x]
-                ax.plot(sorted_x, sorted_y, label=dt, 
-                        color=configs[dt]["color"], 
-                        marker=configs[dt]["marker"], 
-                        markersize=6, linewidth=1.5)
-        
-        ax.set_ylabel('Throughput (MB/s)', fontsize=15)
-        ax.set_xlabel('Cache size (GB)', fontsize=14)
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels([str(t) for t in x_ticks], fontsize=13)
-        ax.set_ylim(0, y_limit)
-        ax.tick_params(axis='y', labelsize=13)
-        
-        # Grid and Spines
-        ax.yaxis.grid(True, linestyle='-', alpha=0.3)
-        ax.set_axisbelow(True)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        
-        # Legend at top
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.15),
-                  ncol=3, frameon=False, fontsize=12, handletextpad=0.1)
-        
-        # Bottom label
-        ax.text(0.5, -0.25, title, transform=ax.transAxes, 
-                fontsize=18, fontweight='bold', ha='center')
+sworn_data['throughput_mib_s'] = pd.to_numeric(sworn_data['throughput_mib_s'])
+sworn_data['waf'] = pd.to_numeric(sworn_data['waf'])
+crypt_data['throughput_mib_s'] = pd.to_numeric(crypt_data['throughput_mib_s'])
 
-    # Draw (a) Writes and (b) Reads
-    draw_subplot(ax1, "write", "(a) 4KB random writes", 450)
-    draw_subplot(ax2, "read", "(b) 4KB random reads", 200)
+# As per your instruction: CryptDisk WAF is fixed at 1.0
+crypt_waf_fixed = [1.0] * len(crypt_data)
 
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.82, bottom=0.22, wspace=0.3)
-    
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Chart successfully saved to {save_path.absolute()}")
+# 2. Plotting Configuration
+plt.rcParams['font.family'] = 'sans-serif'
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-if __name__ == "__main__":
-    try:
-        benchmark_results = load_data(input_path)
-        plot_cache_benchmark(benchmark_results, output_path)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+# Style constants
+marker_size = 6
+line_width = 1.5
+crypt_color = '#e44132' # Red
+sworn_color = '#3b75af' # Blue
+
+# === Plot (a) Write Amplification Factor ===
+# 使用 logical_gb 作为 X 轴，确保点对齐到 10, 20... 90
+# StrataDisk (Blue Triangle)
+ax1.plot(sworn_data['logical_gb'], sworn_data['waf'],
+         label='StrataDisk', color=sworn_color, marker='^', markersize=marker_size, linewidth=line_width)
+# CryptDisk (Red Circle)
+ax1.plot(crypt_data['logical_gb'], crypt_waf_fixed,
+         label='CryptDisk', color=crypt_color, marker='o', markersize=marker_size, linewidth=line_width)
+
+ax1.set_ylabel('Write Amp. Factor', fontsize=14, fontweight='bold')
+ax1.set_ylim(0.90, 1.15)
+ax1.set_yticks([0.90, 0.95, 1.00, 1.05, 1.10, 1.15])
+
+# === Plot (b) Throughput ===
+# StrataDisk (Blue Triangle)
+ax2.plot(sworn_data['logical_gb'], sworn_data['throughput_mib_s'],
+         label='StrataDisk', color=sworn_color, marker='^', markersize=marker_size, linewidth=line_width)
+# CryptDisk (Red Circle)
+ax2.plot(crypt_data['logical_gb'], crypt_data['throughput_mib_s'],
+         label='CryptDisk', color=crypt_color, marker='o', markersize=marker_size, linewidth=line_width)
+
+ax2.set_ylabel('Throughput (MB/s)', fontsize=14, fontweight='bold')
+ax2.set_ylim(0, 500)
+
+# --- Common Formatting for both Subplots ---
+for ax, title in zip([ax1, ax2], ['(a) Write amplification factor', '(b) Throughput']):
+    ax.set_xlabel('Disk utility', fontsize=13)
+
+    # Set X-axis ticks to match logical_gb values (10 to 90)
+    ax.set_xticks([10, 30, 50, 70, 90])
+    ax.set_xticklabels(['10%', '30%', '50%', '70%', '90%'], fontsize=12)
+    ax.tick_params(axis='y', labelsize=12)
+
+    # Leave margin so the rightmost point (90) is not on the border
+    ax.set_xlim(5, 95)
+
+    # Legend at the top (reversed order to match image: CryptDisk first)
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles[::-1], labels[::-1], loc='upper center', bbox_to_anchor=(0.5, 1.15),
+              ncol=2, frameon=False, fontsize=12, handletextpad=0.1, columnspacing=1.0)
+
+    # Horizontal grid lines
+    ax.yaxis.grid(True, linestyle='-', alpha=0.3)
+    ax.set_axisbelow(True)
+
+    # Add title/label at the very bottom
+    ax.text(0.5, -0.3, title, transform=ax.transAxes, fontsize=16,
+            ha='center', va='center', fontweight='bold')
+
+# Adjust layout to make room for labels and legends
+plt.subplots_adjust(top=0.8, bottom=0.25, wspace=0.3)
+
+# 3. Save the result
+output_filename = 'result.png'
+plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+print(f"Chart successfully saved as: {os.path.abspath(output_filename)}")

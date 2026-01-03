@@ -10,7 +10,7 @@ RESULT_JSON="${2:-${OUTPUT_DIR}/filebench_results.json}"
 
 # Workloads and disk types
 WORKLOADS=("fileserver" "oltp" "varmail" "videoserver")
-DISK_TYPES=("PfsDisk" "sworndisk" "cryptdisk")
+DISK_TYPES=("pfsdisk" "sworndisk" "cryptdisk")
 
 function parse_single_result() {
     local txt_file=$1

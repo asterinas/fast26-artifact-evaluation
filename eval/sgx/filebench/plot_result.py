@@ -14,7 +14,7 @@ def load_data(path):
         data = json.load(f)
 
     # Mapping logic
-    disk_map = {"cryptdisk": "CryptDisk", "PfsDisk": "PfsDisk", "sworndisk": "StrataDisk"}
+    disk_map = {"cryptdisk": "CryptDisk", "pfsdisk": "PfsDisk", "sworndisk": "StrataDisk"}
     
     # Define workload order as seen in your reference image
     workload_order = ["fileserver", "varmail", "oltp", "videoserver"]

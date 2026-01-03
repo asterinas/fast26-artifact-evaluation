@@ -3,3 +3,5 @@ occlum_instance/
 output.txt
 result.json
 benchmark_results/
+results/
+result.png
