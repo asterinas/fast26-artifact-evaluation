@@ -1,15 +1,28 @@
-# Cache Size Benchmark
+# Cache Size Sensitivity
 
-Runs 4KB random write and read fio workloads across cache sizes for `PfsDisk`, `sworndisk`, and `cryptdisk`.
+Tests 4KB random write/read performance across different cache sizes (256MB - 1536MB) for PfsDisk, StrataDisk, and CryptDisk.
+
+## Prerequisites
+
+FIO must be built first:
+```bash
+cd ../fio && ./download_and_build_fio.sh
+```
 
 ## Run
-```
-cd eval/cache_size
+
+```bash
 ./reproduce.sh
 ```
 
-## Output
-- Results JSON: `benchmark_results/cache_size_result.json`
-- Raw fio logs: `benchmark_results/${disk}_cache${size}_{randwrite|randread}.txt`
+## Plot
 
-Only throughput (MiB/s) is recorded in the JSON for plotting.
+```bash
+python3 plot_result.py
+```
+
+## Output
+
+- Results JSON: `results/cache_size_result.json`
+- Raw FIO logs: `results/${disk}_cache${size}_rand{write|read}.txt`
+- Plot: `result.png`

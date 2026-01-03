@@ -1,25 +1,25 @@
-## Run MSR trace on Occlum
+# MSR Trace Replay
 
-### Step 1: Prepare docker image and build Occlum
-```
-sudo docker pull occlum/occlum:0.31.0-rc-ubuntu22.04
+Replays MSR Cambridge traces (`hm_0`, `mds_0`, `prn_0`, `wdev_0`, `web_0`) on PfsDisk, StrataDisk, and CryptDisk.
 
-git clone https://github.com/lucassong-mh/occlum.git -b dev-atomicdisk-fast25 {occlum_src_path}
+## Prerequisites
 
-sudo docker run -it --device /dev/sgx/enclave --device /dev/sgx/provision --name "ssw-occlum-0.31.0-rc-dev" --net=host -v "{occlum_src_path}:/root/occlum" occlum/occlum:0.31.0-rc-ubuntu22.04
+Trace files must be available in `msr-test/`. If missing, download from [SNIA IOTTA](https://iotta.snia.org/traces/block-io/388) and place the CSV files there.
 
-git config --global --add safe.directory /root/occlum  // And other dependent repos
+## Run
 
-// Inside container
-cd /root/occlum
-make submodule
-OCCLUM_RELEASE_BUILD=1 make install
+```bash
+./reproduce.sh
 ```
 
-### Step 2: Download trace to msr-test/
+## Plot
 
-### Step 3: Run trace workloads
+```bash
+python3 plot_result.py
 ```
-cd demos/benchmarks/trace && ./run_trace_bench.sh wdev
-./run_trace_bench.sh hm
-```
+
+## Output
+
+- Results JSON: `results/trace_reproduce_result.json`
+- Raw logs: `results/${trace}_${disk}_output.txt`
+- Plot: `result.png`

@@ -1,25 +1,27 @@
-## Run Filebench on Occlum
+# Filebench
 
-[Filebench](https://github.com/Filebench/Filebench) is a benchmark tool aiming to test the file system and the storage system under certain workloads. This demo demonstrates how can Filebench run on Occlum.
+Tests filesystem performance using [Filebench](https://github.com/Filebench/Filebench) workloads: `fileserver`, `oltp`, `varmail`, `videoserver`.
 
-### Step 1: Preinstall dependencies
-Related dependencies: bison flex
-```
-cd demos/benchmarks/filebench && ./preinstall_deps.sh
-```
+## Run
 
-### Step 2: Build Filebench from source
-```
-cd demos/benchmarks/filebench && ./dl_and_build_Filebench.sh
+Step 1: Install dependencies and build Filebench (skip if already built)
+```bash
+./preinstall_deps.sh
+./dl_and_build_filebench.sh
 ```
 
-The script will download the source code, make some adaptation then compile Filebench into a binary.
-
-### Step 3: Run Filebench workloads
-```
-cd demos/benchmarks/filebench && ./run_workload.sh <workload_name>
+Step 2: Run benchmarks
+```bash
+./reproduce.sh
 ```
 
-The script will run user-specific workloads under `filebench/workloads`. The corresponding results will be outputed.
+Step 3: Plot results
+```bash
+python3 plot_result.py
+```
 
-Refer to [Filebench/wiki/Workload-model-language](https://github.com/Filebench/Filebench/wiki/Workload-model-language) and see more information about workloads.
+## Output
+
+- Results JSON: `results/filebench_results.json`
+- Raw logs: `results/${workload}_${disk}_output.txt`
+- Plot: `result.png`
