@@ -11,13 +11,14 @@ BOMFILE="${SCRIPT_DIR}/cleaning.yaml"
 OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
 
 # Tunables (override via env): GiB sizes keep parity with cleaning.cpp defaults.
+
 DISK_PATH=${DISK_PATH:-/dev/sworndisk}
-TOTAL_GB=${TOTAL_GB:-90}
-BATCH_GB=${BATCH_GB:-9}
+TOTAL_GB=${TOTAL_GB:-50}
+BATCH_GB=${BATCH_GB:-5}
 USED_RATE=${USED_RATE:-0.8}
-INTERVAL_SEC=${INTERVAL_SEC:-30}
 LOOP_TIMES=${LOOP_TIMES:-10}
-DISK_SIZE=${DISK_SIZE:-100GB}
+INTERVAL_SEC=${INTERVAL_SEC:-30}
+DISK_SIZE=${DISK_SIZE:-60GB}
 
 compile_cleaning() {
     echo -e "${YELLOW}Compiling cleaning benchmark...${NC}" >&2
@@ -35,8 +36,8 @@ init_occlum_instance() {
     new_json="$(jq --argjson THREAD_NUM "${TCS_NUM}" --arg DISK_NAME "sworndisk" --arg DISK_SIZE "${DISK_SIZE}" '
         .resource_limits.user_space_size="2000MB" |
         .resource_limits.user_space_max_size="2000MB" |
-        .resource_limits.kernel_space_heap_size="5000MB" |
-        .resource_limits.kernel_space_heap_max_size="5000MB" |
+        .resource_limits.kernel_space_heap_size="3000MB" |
+        .resource_limits.kernel_space_heap_max_size="3000MB" |
         .resource_limits.max_num_of_threads=$THREAD_NUM |
         .mount += [{"target": "/ext2", "type": "ext2", "options": {"disk_size": $DISK_SIZE, "disk_name": $DISK_NAME,"sync_atomicity": false,"enable_gc":true}}]
     ' Occlum.json)"

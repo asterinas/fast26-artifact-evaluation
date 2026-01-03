@@ -82,9 +82,10 @@ static bool prefill_disk(int fd, long long bytes, void *buf) {
 
 static bool run_rounds(int fd, const Options &opt, void *buf, long long usable_blocks) {
     mt19937_64 rng(chrono::high_resolution_clock::now().time_since_epoch().count());
-    uniform_int_distribution<long long> dist(0, usable_blocks - 1);
 
     long long blocks_per_round = opt.batch_bytes / kBlockSize;
+    // Limit random writes to [0, blocks_per_round) to keep reclaimed space concentrated
+    uniform_int_distribution<long long> dist(0, blocks_per_round - 1);
     if (blocks_per_round <= 0) {
         cerr << "batch_bytes too small" << endl;
         return false;

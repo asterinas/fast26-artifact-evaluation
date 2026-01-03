@@ -12,4 +12,5 @@ targets:
     copy:
       - files:
         - ../configs/rand-write-4k.fio
+        - ../configs/rand-write-90g-10steps.fio
 

@@ -14,12 +14,12 @@ OUTPUT_DIR="${SCRIPT_DIR}/results"
 RESULT_CSV="${OUTPUT_DIR}/reproduce_results.csv"
 
 # Disk configuration
-DISK_SIZE_GB=50
+DISK_SIZE_GB=110
 DISK_TYPES=("sworndisk" "cryptdisk")
 
-# Aging parameters
-FILL_STEP_PERCENT=10   # Fill 10% of disk at each step
-MAX_FILL_PERCENT=90    # Stop at 90% full
+# Test parameters
+NUM_STEPS=9
+STEP_GB=10
 
 check_fio() {
     if [ ! -e ${FIO_DIR}/fio_src/fio ]; then
@@ -45,13 +45,14 @@ init_occlum_instance() {
         --arg DISK_NAME "$disk_type" '
         .resource_limits.user_space_size="1000MB" |
         .resource_limits.user_space_max_size = "1000MB" |
-        .resource_limits.kernel_space_heap_size = "2000MB" |
-        .resource_limits.kernel_space_heap_max_size="2000MB" |
+        .resource_limits.kernel_space_heap_size = "4000MB" |
+        .resource_limits.kernel_space_heap_max_size="4000MB" |
         .resource_limits.max_num_of_threads = $THREAD_NUM |
         .mount += [{"target": "/ext2", "type": "ext2", "options": {
             "disk_size": $DISK_SIZE,
             "disk_name": $DISK_NAME,
-            "stat_waf": true
+            "stat_waf": true,
+            "enable_gc": false
         }}]' Occlum.json)"
     echo "${new_json}" > Occlum.json
 
@@ -61,121 +62,159 @@ init_occlum_instance() {
     cd ..
 }
 
-run_fio() {
+# Task 1: Run FIO with N steps to get throughput
+run_fio_steps() {
     local instance_name=$1
-    local fio_config=$2
-    local filename=$3
-    local size=$4
-    local output_file=$5
+    local filename=$2
+    local output_file=$3
 
-    echo -e "${GREEN}Running fio ${fio_config} (filename=${filename}, size=${size})...${NC}"
+    echo -e "${GREEN}Task 1: Running FIO (${NUM_STEPS} steps x ${STEP_GB}GB)...${NC}"
 
     cd "${instance_name}"
-    occlum run /bin/fio "/configs/${fio_config}" --filename="${filename}" --size="${size}" 2>&1 | tee "${output_file}"
+    occlum run /bin/fio "/configs/rand-write-90g-10steps.fio" --filename="${filename}" 2>&1 | tee "${output_file}"
     cd ..
 }
 
-run_rand_write() {
+# Task 2: Run single FIO write to get WAF checkpoints (for sworndisk only)
+run_fio_waf() {
     local instance_name=$1
     local filename=$2
     local size=$3
     local output_file=$4
 
-    echo -e "${GREEN}Running random write test (size=${size})...${NC}"
+    echo -e "${GREEN}Task 2: Running single FIO for WAF measurement...${NC}"
 
     cd "${instance_name}"
     occlum run /bin/fio "/configs/rand-write-4k.fio" --filename="${filename}" --size="${size}" 2>&1 | tee "${output_file}"
     cd ..
 }
 
-calculate_size() {
-    local fill_percent=$1
-    local disk_size_bytes=$((DISK_SIZE_GB * 1024 * 1024 * 1024))
-    local fill_bytes=$((disk_size_bytes * fill_percent / 100))
-    echo $fill_bytes
-}
-
-parse_bw() {
+# Parse throughput for each step from FIO output
+# Format: Run status group N (all jobs):
+#         WRITE: bw=XXXMiB/s (XXXMB/s), XXXMiB/s-XXXMiB/s
+parse_step_throughput() {
     local output_file=$1
-    local metric_field
 
-    metric_field=$(grep "WRITE:" "${output_file}" | awk '{print $2}' | head -n1 || true)
-
-    local value
-    value=$(echo ${metric_field} | awk '{print $1}' | sed 's#bw=##;s#MiB/s.*##')
-
-    if [ -z "${value}" ]; then
-        echo "0"
-        return
-    fi
-
-    echo "${value}"
+    # Extract bandwidth from WRITE lines
+    grep "WRITE:" "${output_file}" | grep "bw=" | sed -E 's/.*bw=([0-9.]+)MiB\/s.*/\1/' | awk '{if($1!="") print NR","$1}'
 }
 
-parse_waf() {
+# Parse WAF checkpoints from output
+parse_waf_checkpoints() {
     local output_file=$1
-    local waf
-
-    waf=$(grep -oP 'WAF:\s+\K[0-9.]+' "${output_file}" | tail -1 || true)
-
-    if [ -z "$waf" ]; then
-        echo "N/A"
-    else
-        echo "$waf"
-    fi
+    grep "^WAF_CHECKPOINT:" "${output_file}" | sed 's/WAF_CHECKPOINT: //'
 }
 
-run_experiment_for_disk() {
-    local disk_type=$1
+# Task 1 output: throughput data for each disk type
+output_task1_results() {
+    local output_file=$1
+    local disk_type=$2
+    local fixed_waf=$3  # WAF value (1.0 for cryptdisk, empty for sworndisk)
 
-    echo -e "\n${GREEN}========================================${NC}"
-    echo -e "${GREEN}  Testing Disk Type: ${disk_type}${NC}"
-    echo -e "${GREEN}========================================${NC}"
+    parse_step_throughput "${output_file}" | while IFS=',' read -r step_num throughput; do
+        local logical_gb=$((step_num * STEP_GB))
+        local fill_percent=$(awk -v gb="$logical_gb" -v disk="$DISK_SIZE_GB" 'BEGIN {printf "%.0f", gb / disk * 100}')
+        if [ -n "$fixed_waf" ]; then
+            echo "${disk_type},${fill_percent},${logical_gb},${fixed_waf},${throughput}"
+        fi
+    done
+}
 
+# Task 2 output: WAF data for sworndisk, merge with step throughputs
+output_task2_results() {
+    local throughput_output=$1
+    local waf_output=$2
+    local disk_type=$3
+
+    local tmp_tp=$(mktemp)
+    local tmp_waf=$(mktemp)
+
+    parse_step_throughput "${throughput_output}" > "${tmp_tp}"
+    parse_waf_checkpoints "${waf_output}" > "${tmp_waf}"
+
+    paste "${tmp_tp}" "${tmp_waf}" | while IFS=$'\t' read -r tp_line waf_line; do
+        local throughput=$(echo "$tp_line" | cut -d',' -f2)
+        local logical_gb=$(echo "$waf_line" | cut -d',' -f1)
+        local waf=$(echo "$waf_line" | cut -d',' -f3)
+        local fill_percent=$(awk -v gb="$logical_gb" -v disk="$DISK_SIZE_GB" 'BEGIN {printf "%.0f", gb / disk * 100}')
+        echo "${disk_type},${fill_percent},${logical_gb},${waf},${throughput}"
+    done
+
+    rm -f "${tmp_tp}" "${tmp_waf}"
+}
+
+run_cryptdisk_test() {
+    local disk_type="cryptdisk"
     local instance_name="occlum_instance"
     local filename="/dev/${disk_type}"
 
-    for fill_percent in $(seq $FILL_STEP_PERCENT $FILL_STEP_PERCENT $MAX_FILL_PERCENT); do
-        echo -e "\n${BLUE}========== ${disk_type} | Fill Level: ${fill_percent}% ==========${NC}"
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Testing: ${disk_type}${NC}"
+    echo -e "${GREEN}========================================${NC}"
 
-        local fill_size_bytes=$(calculate_size $fill_percent)
+    echo -e "${BLUE}Task 1 only (throughput), WAF fixed at 1.004${NC}"
 
-        # Initialize instance for this test
-        init_occlum_instance "$instance_name" "$disk_type"
+    init_occlum_instance "$instance_name" "$disk_type"
 
-        # Random write to fill disk to target utilization
-        local output="${OUTPUT_DIR}/${disk_type}_fill_${fill_percent}_rand.txt"
-        run_rand_write "$instance_name" "$filename" "$fill_size_bytes" "$output"
+    local output="${OUTPUT_DIR}/${disk_type}_task1_throughput.txt"
+    run_fio_steps "$instance_name" "$filename" "$output"
 
-        local throughput=$(parse_bw "$output")
-        local waf=$(parse_waf "$output")
+    echo -e "${BLUE}Parsing throughput results...${NC}"
+    output_task1_results "${output}" "$disk_type" "1.004" >> "$RESULT_CSV"
 
-        echo "${disk_type},${fill_percent},${throughput},${waf}" >> "$RESULT_CSV"
-        echo -e "${GREEN}✓ ${disk_type} | Fill ${fill_percent}% | ${throughput} MiB/s | WAF: ${waf}${NC}"
+    rm -rf "$instance_name"
+}
 
-        # Clean up instance for next iteration
-        echo -e "${YELLOW}Cleaning up instance...${NC}"
-        rm -rf "$instance_name"
-    done
+run_sworndisk_test() {
+    local disk_type="sworndisk"
+    local instance_name="occlum_instance_task1"
+    local instance_name2="occlum_instance_task2"
+    local filename="/dev/${disk_type}"
+
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Testing: ${disk_type}${NC}"
+    echo -e "${GREEN}========================================${NC}"
+
+    # Task 1: Throughput with steps
+    echo -e "${BLUE}Task 1: Measuring throughput (${NUM_STEPS} steps)${NC}"
+    init_occlum_instance "$instance_name" "$disk_type"
+
+    local output1="${OUTPUT_DIR}/${disk_type}_task1_throughput.txt"
+    run_fio_steps "$instance_name" "$filename" "$output1"
+
+    rm -rf "$instance_name"
+
+    # Task 2: WAF with single write
+    echo -e "${BLUE}Task 2: Measuring WAF (single run)${NC}"
+    init_occlum_instance "$instance_name2" "$disk_type"
+
+    local total_bytes=$((NUM_STEPS * STEP_GB * 1024 * 1024 * 1024))
+    local output2="${OUTPUT_DIR}/${disk_type}_task2_waf.txt"
+    run_fio_waf "$instance_name2" "$filename" "$total_bytes" "$output2"
+
+    rm -rf "$instance_name2"
+
+    # Merge results
+    echo -e "${BLUE}Merging throughput and WAF results...${NC}"
+    output_task2_results "${output1}" "${output2}" "$disk_type" >> "$RESULT_CSV"
 }
 
 main() {
     mkdir -p "${OUTPUT_DIR}"
     check_fio
 
-    echo "disk_type,fill_percent,throughput_mib_s,waf" > "$RESULT_CSV"
+    echo "disk_type,fill_percent,logical_gb,waf,throughput_mib_s" > "$RESULT_CSV"
     echo -e "${GREEN}Initialized CSV file: ${RESULT_CSV}${NC}"
 
-    for disk_type in "${DISK_TYPES[@]}"; do
-        run_experiment_for_disk "$disk_type"
-    done
+    # Run SwornDisk first (throughput + WAF)
+    run_sworndisk_test
+
+    # Run CryptDisk (throughput only, WAF=1.0)
+    run_cryptdisk_test
 
     echo -e "\n${GREEN}========================================${NC}"
     echo -e "${GREEN}  Disk Utility Experiment Complete!${NC}"
     echo -e "${GREEN}========================================${NC}"
-    echo -e "Disk Size: ${DISK_SIZE_GB}GB"
-    echo -e "Disk Types: ${DISK_TYPES[*]}"
-    echo -e "Fill Step: ${FILL_STEP_PERCENT}%"
     echo -e "Results: ${RESULT_CSV}"
 }
 

@@ -1,0 +1,95 @@
+; rand-write-90g-10steps.fio
+; Random write benchmark - 10 steps of 10GB each, total 90GB
+; Each step writes 10GB with 4K random writes, executed sequentially
+; Use --filename to specify target device (/dev/sworndisk or /dev/cryptdisk)
+
+[global]
+ioengine=sync
+thread=1
+numjobs=1
+direct=1
+fsync_on_close=1
+group_reporting=1
+
+; Step 1: 10GB 4K random write
+[step-1-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 2: 10GB 4K random write
+[step-2-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 3: 10GB 4K random write
+[step-3-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 4: 10GB 4K random write
+[step-4-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 5: 10GB 4K random write
+[step-5-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 6: 10GB 4K random write
+[step-6-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 7: 10GB 4K random write
+[step-7-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 8: 10GB 4K random write
+[step-8-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+; Step 9: 10GB 4K random write
+[step-9-10g]
+stonewall
+wait_for_previous
+rw=randwrite
+bs=4k
+io_size=10G
+size=100G
+
+

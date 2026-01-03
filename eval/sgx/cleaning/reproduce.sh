@@ -13,11 +13,11 @@ OUTPUT_DIR="${SCRIPT_DIR}/results"
 
 # Tunables (override via env)
 DISK_PATH=${DISK_PATH:-/dev/sworndisk}
-TOTAL_GB=${TOTAL_GB:-50}
-BATCH_GB=${BATCH_GB:-5}
+TOTAL_GB=${TOTAL_GB:-100}
+BATCH_GB=${BATCH_GB:-10}
 USED_RATE=${USED_RATE:-0.8}
 LOOP_TIMES=${LOOP_TIMES:-10}
-DISK_SIZE=${DISK_SIZE:-60GB}
+DISK_SIZE=${DISK_SIZE:-120GB}
 
 # Test configurations: (enable_gc, interval_sec, config_name)
 declare -a CONFIGS=(
@@ -47,8 +47,8 @@ init_occlum_instance() {
                    --argjson ENABLE_GC "${enable_gc}" '
         .resource_limits.user_space_size="2000MB" |
         .resource_limits.user_space_max_size="2000MB" |
-        .resource_limits.kernel_space_heap_size="3000MB" |
-        .resource_limits.kernel_space_heap_max_size="3000MB" |
+        .resource_limits.kernel_space_heap_size="5000MB" |
+        .resource_limits.kernel_space_heap_max_size="5000MB" |
         .resource_limits.max_num_of_threads=$THREAD_NUM |
         .mount += [{"target": "/ext2", "type": "ext2", "options": {"disk_size": $DISK_SIZE, "disk_name": $DISK_NAME, "sync_atomicity": false, "enable_gc": $ENABLE_GC}}]
     ' Occlum.json)"
