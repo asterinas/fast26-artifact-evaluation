@@ -40,7 +40,7 @@ Benchmarks for running the storage stack inside SGX (Occlum).
 - Some benchmarks take a long time; run them in a **tmux** session to keep them alive in the background.
 
 ### FIO/ — Micro-benchmarks
-- What: Seq/rand read/write on PfsDisk/SwornDisk/CryptDisk (per config).
+- What: Seq/rand read/write on PfsDisk/StrataDisk/CryptDisk (per config).
 - Prep:
   ```bash
   cd fio && ./download_and_build_fio.sh
@@ -85,7 +85,7 @@ Benchmarks for running the storage stack inside SGX (Occlum).
   ```
 
 ### Cache Size/ — Cache size sensitivity
-- What: 4K randwrite/randread vs. cache size for `sworndisk` and `cryptdisk`.
+- What: 4K randwrite/randread vs. cache size for StrataDisk and CryptDisk.
 - Run:
   ```bash
   cd cache_size
@@ -120,7 +120,7 @@ Benchmarks for running the storage stack inside SGX (Occlum).
   python3 plot_result.py
   ```
 
-### Optimization/ — MlsDisk feature toggles
+### Optimization/ — StrataDisk feature toggles
 - What: `delayed_reclamation` (rand write) and `two_level_caching` (rand read).
 - Run:
   ```bash
